@@ -8,7 +8,7 @@ Directly compatible with MSNet outputs.
 - R runs inside your web browser (Shinylive / webR, including `mixOmics`): no R installation needed.
 - The first load takes 30-90 s (R and the packages are downloaded into the browser), later visits are faster.
 - **Your data never leaves your computer**: files are processed locally in the browser.
-- Pick an *Example dataset* in the sidebar and click *Load example data* to try it.
+- Click *Load example data* in the sidebar to try it with the Cannabis chemotypes dataset (`Dataset/Cannabis/`).
 - Heavy computations (tuning, repeated cross-validation) are slower in the browser than in desktop R; the default number of repeats is reduced accordingly. For large datasets, run the app in desktop R (see below).
 
 ## Features

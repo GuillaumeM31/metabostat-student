@@ -94,13 +94,7 @@ document.addEventListener('click', async function (e) {
 # Example datasets shipped next to the app (relative to the app folder).
 EXAMPLES <- list(
   "Cannabis chemotypes (LC-MS, 18 samples, with feature metadata)" =
-    list(data = "StatTableNEGPOS.csv", meta = "NodesNEGPOS.csv", group = "Class"),
-  "Stevia - untargeted (798 features, missing values)" =
-    list(data = "UntargetedStevia.csv", meta = NULL, group = "Class"),
-  "Stevia - semi-targeted steviol glycosides" =
-    list(data = "Semitargeted-SGs.csv", meta = NULL, group = "Class"),
-  "Stevia - quantified steviol glycosides (ppm)" =
-    list(data = "QuantificationSGsStd-ppm.csv", meta = NULL, group = "Class")
+    list(data = "StatTableNEGPOS.csv", meta = "NodesNEGPOS.csv", group = "Class")
 )
 
 ui <- fluidPage(
@@ -258,7 +252,7 @@ ui <- fluidPage(
                   h4(icon("upload"), " Step 1: Data Upload")),
               div(class = "panel-body",
                   tags$ol(
-                    tags$li(strong("Try it first:"), " pick an example dataset and click 'Load example data' (Cannabis chemotypes, Stevia)"),
+                    tags$li(strong("Try it first:"), " pick an example dataset and click 'Load example data' (Cannabis chemotypes)"),
                     tags$li(strong("Main Data File:"), " Upload your metabolomics data matrix as CSV/TXT"),
                     tags$ul(
                       tags$li("Rows = samples, Columns = features + one grouping column"),
