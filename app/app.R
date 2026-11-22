@@ -1145,10 +1145,11 @@ server <- function(input, output, session) {
   }
 
   # Reproducible cross-validation / tuning / permutations
-  apply_seed <- function() {
+  seed_value <- function() {
     s <- suppressWarnings(as.integer(input$seed))
-    if (length(s) == 1 && !is.na(s)) set.seed(s)
+    if (length(s) == 1 && !is.na(s)) s else 123L
   }
+  apply_seed <- function() set.seed(seed_value())
 
   # Output for conditional panel
   output$metadata_loaded <- reactive({
@@ -2565,7 +2566,7 @@ server <- function(input, output, session) {
     withProgress(message = "Computing performance...", value = 0.3, {
       tryCatch({
         args <- list(plsda_model(), validation = input$plsda_cv_method,
-                     progressBar = FALSE, auc = TRUE)
+                     progressBar = FALSE, auc = TRUE, seed = seed_value())
         if (input$plsda_cv_method == "Mfold") {
           # Never more folds than the smallest group can fill
           folds <- cv_folds(input$plsda_folds, groups_filtered())
@@ -2689,7 +2690,8 @@ server <- function(input, output, session) {
           measure = "BER",
           test.keepX = test_keepX,
           scale = FALSE,
-          progressBar = FALSE
+          progressBar = FALSE,
+          seed = seed_value()
         )
         
         rv$splsda_tune_result <- tune_result
@@ -2801,7 +2803,8 @@ server <- function(input, output, session) {
           folds = n_folds,
           nrepeat = if (IS_WEBR) 10 else 50,
           progressBar = FALSE,
-          auc = TRUE
+          auc = TRUE,
+          seed = seed_value()
         )
 
         rv$splsda_final_perf <- perf_res
@@ -3183,7 +3186,8 @@ server <- function(input, output, session) {
 
       withProgress(message = "Computing PLS-R performance...", value = 0.3, {
         tryCatch({
-          args <- list(plsr_model(), validation = input$plsr_cv_method, progressBar = FALSE)
+          args <- list(plsr_model(), validation = input$plsr_cv_method, progressBar = FALSE,
+                       seed = seed_value())
           if (input$plsr_cv_method == "Mfold") {
             args$folds <- cv_folds(input$plsr_folds, n = nrow(X_plsr()))
             args$nrepeat <- input$plsr_nrepeat
@@ -3313,7 +3317,8 @@ server <- function(input, output, session) {
             measure = input$splsr_tune_measure,
             test.keepX = test_keepX,
             scale = FALSE,
-            progressBar = FALSE
+            progressBar = FALSE,
+            seed = seed_value()
           )
 
           rv$splsr_tune_result <- tune_result
@@ -3446,7 +3451,8 @@ server <- function(input, output, session) {
             validation = "Mfold",
             folds = n_folds,
             nrepeat = if (IS_WEBR) 10 else 50,
-            progressBar = FALSE
+            progressBar = FALSE,
+            seed = seed_value()
           )
 
           rv$splsr_final_perf <- perf_res
