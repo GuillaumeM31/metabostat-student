@@ -148,6 +148,7 @@ Contributors: Claude AI (Shiny application and metadata enhancement support)
 - **PERMANOVA uses the Euclidean distance** (the default Bray-Curtis is meaningless on scores with negative values).
 - **"sPLS-DA -> Univariate" no longer filters the multivariate models** (and vice versa); the univariate p-values stay adjusted over all tested features; cached models/tuning/performance are cleared when the data change.
 - Sortable p-value columns, correct sample names in exported tables, same figure on screen and in PDF for boxplots/volcano, Tukey letters for group names containing "-", decimal-comma files detected correctly.
+- **Feature labels**: when metadata are loaded, any metadata column (metabolite name, class, m/z...) can replace the feature IDs in the volcano plot, heatmaps, loadings, VIP plot, boxplots and tables (truncated to 10 characters by default; CSV exports keep the IDs).
 - Caveats are now shown in the app: PLS-DA PERMANOVA and AUROC are computed on training data (optimistic); pre-selecting features before cross-validation biases the error rate.
 
 ## License

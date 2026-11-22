@@ -101,6 +101,13 @@ ui <- fluidPage(
   theme = shinytheme("flatly"),
   useShinyjs(),
   tags$head(tags$script(HTML(download_js))),
+  # Load the DataTables JavaScript with the page: otherwise, in the browser
+  # version, tables rendered at the same time as the library is first fetched
+  # stay empty ("$table.DataTable is not a function").
+  htmltools::attachDependencies(
+    tags$div(style = "display: none;"),
+    htmltools::findDependencies(DT::datatable(data.frame(x = 1)))
+  ),
   
   titlePanel(
     div(
@@ -170,6 +177,9 @@ ui <- fluidPage(
         condition = "output.metadata_loaded",
         h4("5. Metadata Annotation"),
         selectInput("heatmap_annotation_col", "Heatmap Annotation (used in Univariate & Multivariate heatmaps):", choices = NULL),
+        selectInput("feature_label_col", "Feature labels in plots and tables:", choices = NULL),
+        helpText("Replace the feature IDs by a metadata column (e.g. the metabolite name) in the volcano plot, heatmaps, loadings, VIP and boxplots. Features without a name keep their ID; CSV exports keep the IDs."),
+        numericInput("feature_label_max", "Max label length (characters):", value = 10, min = 5, max = 200),
         tags$hr()
       ),
 
@@ -1251,6 +1261,9 @@ server <- function(input, output, session) {
                       selected = guess_feature_id_col(md, feature_names))
     updateSelectInput(session, "heatmap_annotation_col", choices = c("None" = "", character_cols))
     updateSelectInput(session, "volcano_size_col", choices = c("None" = "", numeric_cols))
+    # Any metadata column can serve as label (name, class, m/z, ...)
+    updateSelectInput(session, "feature_label_col", choices = c("Feature ID" = "", names(md)),
+                      selected = "")
   }
 
   load_metadata <- function(path) {
@@ -1459,6 +1472,44 @@ server <- function(input, output, session) {
 
     return(matched_df)
   })
+
+  # Display labels for feature IDs: the metadata column chosen in sidebar
+  # section 5 (truncated), or the ID itself when no name is available.
+  # Duplicated names get their ID appended so that labels stay unique.
+  feature_labels <- function(ids) {
+    ids <- as.character(ids)
+    md <- matched_metadata()
+    col <- input$feature_label_col
+    if (is.null(md) || is.null(col) || col == "" || !(col %in% names(md))) return(ids)
+
+    v <- md[ids, col]
+    if (is.numeric(v)) v <- ifelse(is.na(v), NA, format(signif(v, 6), trim = TRUE))
+    v <- trimws(as.character(v))
+    ok <- !is.na(v) & v != "" & !(tolower(v) %in% c("unknown", "na", "nan", "null", "none"))
+    max_chars <- suppressWarnings(as.integer(input$feature_label_max))
+    if (length(max_chars) != 1 || is.na(max_chars) || max_chars < 5) max_chars <- 10
+    long <- ok & nchar(v) > max_chars
+    v[long] <- paste0(substr(v[long], 1, max_chars - 3), "...")
+
+    lab <- ifelse(ok, v, ids)
+    dup <- ok & (lab %in% lab[duplicated(lab)])
+    lab[dup] <- paste0(lab[dup], " [", ids[dup], "]")
+    lab
+  }
+
+  # Plot title: "Name (ID)" when a label is active
+  feature_title <- function(id) {
+    lab <- feature_labels(id)
+    if (identical(lab, as.character(id))) id else paste0(lab, " (", id, ")")
+  }
+
+  # Adds a "Label" column after "Variable" when labels are active
+  add_label_column <- function(df) {
+    if (is.null(input$feature_label_col) || input$feature_label_col == "" || is.null(matched_metadata())) return(df)
+    df <- as.data.frame(df)
+    df$Label <- feature_labels(df$Variable)
+    df[, c("Variable", "Label", setdiff(names(df), c("Variable", "Label")))]
+  }
 
   # Dynamic UI for group selection
   output$group_selector_ui <- renderUI({
@@ -2012,7 +2063,7 @@ server <- function(input, output, session) {
   output$univariate_table <- DT::renderDataTable({
     req(filtered_univariate_results())
     
-    results_df <- filtered_univariate_results()
+    results_df <- add_label_column(filtered_univariate_results())
     
     # Add metadata if available
     if(!is.null(matched_metadata()) && !is.null(input$heatmap_annotation_col) && 
@@ -2055,7 +2106,7 @@ server <- function(input, output, session) {
     mat <- scale(mat)
     mat[!is.finite(mat)] <- 0
     mat_t <- t(mat)                      # features (rows) x samples (cols)
-    rownames(mat_t) <- substring(rownames(mat_t), 1, 20)
+    rownames(mat_t) <- feature_labels(top_vars)
 
     # Row (feature) side colors from metadata, in the SAME (pre-cluster) order
     # as mat_t's rows - cim() reorders these itself alongside the matrix rows.
@@ -2291,7 +2342,8 @@ server <- function(input, output, session) {
       sig_data <- sig_data[order(sig_data$adj_pvalue), ]
       sig_data <- sig_data[seq_len(min(input$volcano_n_labels, nrow(sig_data))), ]
       if (nrow(sig_data) > 0) {
-        p <- p + geom_text_repel(data = sig_data, aes(label = Variable), size = 3)
+        sig_data$Label <- feature_labels(sig_data$Variable)
+        p <- p + geom_text_repel(data = sig_data, aes(label = Label), size = 3, max.overlaps = 30)
       }
     }
     
@@ -2311,7 +2363,7 @@ server <- function(input, output, session) {
   output$volcano_table <- DT::renderDataTable({
     req(significant_volcano_results())
     
-    results_df <- significant_volcano_results()
+    results_df <- add_label_column(significant_volcano_results())
     
     # Add metadata if available
     if(!is.null(matched_metadata()) && !is.null(input$volcano_size_col) && 
@@ -2345,7 +2397,7 @@ server <- function(input, output, session) {
     y_lab <- if (has_unscaled) "Abundance (unscaled)" else "Value"
     
     ggboxplot(plot_data, x = "Group", y = "Value", fill = "Group",
-              palette = c("blue", "red"), title = paste(var_name),
+              palette = c("blue", "red"), title = feature_title(var_name),
               ylab = y_lab) +
       stat_compare_means(method = if(input$use_nonparametric) "wilcox.test" else "t.test") +
       theme_minimal() + theme(legend.position = "none")
@@ -2378,13 +2430,13 @@ server <- function(input, output, session) {
       p <- ggplot(plot_data, aes(x = Group, y = Value, fill = Group)) +
         geom_violin(trim = FALSE, alpha = 0.7) +
         scale_fill_manual(values = mixOmics::color.mixo(1:n_groups)) +
-        labs(title = paste("Violin plot:", var_name), x = "", y = "Value") +
+        labs(title = paste("Violin plot:", feature_title(var_name)), x = "", y = "Value") +
         theme_minimal(base_size = 14) +
         theme(legend.position = "none")
     } else {
       p <- ggboxplot(plot_data, x = "Group", y = "Value", fill = "Group",
                      palette = mixOmics::color.mixo(1:n_groups),
-                     title = paste("Boxplot:", var_name),
+                     title = paste("Boxplot:", feature_title(var_name)),
                      xlab = "", ylab = "Value")
     }
     if (input$add_points) {
@@ -2445,6 +2497,7 @@ server <- function(input, output, session) {
     # hd$mat_ordered is features (rows) x samples (cols), in clustered/plotted order.
     # Transpose back to samples x features for a human-friendly CSV, keeping order.
     df <- as.data.frame(t(hd$mat_ordered))
+    colnames(df) <- hd$top_vars_ordered
     df <- cbind(Sample = hd$sample_names_ordered, Group = hd$groups_ordered, df)
     rownames(df) <- NULL
     df
@@ -2885,7 +2938,7 @@ server <- function(input, output, session) {
     if (model$ncomp >= 1) {
       tryCatch({
         mixOmics::plotLoadings(model, comp = 1, method = "median", contrib = "max", 
-                               size.name = 0.5, name.var = NULL)
+                               size.name = 0.5, name.var = feature_labels(colnames(model$X)))
       }, error = function(e) {
         validate(need(FALSE, "Loadings plot error: try enlarging plot window or reduce number of features"))
       })
@@ -2898,7 +2951,7 @@ server <- function(input, output, session) {
     if (model$ncomp >= 2) {
       tryCatch({
         mixOmics::plotLoadings(model, comp = 2, method = "median", contrib = "max",
-                               size.name = 0.5, name.var = NULL)
+                               size.name = 0.5, name.var = feature_labels(colnames(model$X)))
       }, error = function(e) {
         validate(need(FALSE, "Loadings plot error: try enlarging plot window or reduce number of features"))
       })
@@ -2928,7 +2981,7 @@ server <- function(input, output, session) {
     mat_scaled <- scale(mat)
     mat_scaled[!is.finite(mat_scaled)] <- 0
     mat_t <- t(mat_scaled)   # features x samples
-    rownames(mat_t) <- substring(rownames(mat_t), 1, 40)
+    rownames(mat_t) <- feature_labels(all_selected_features)
 
     # Row (feature) side colors from metadata, in the SAME (pre-cluster) order
     # as mat_t's rows - cim() reorders these itself alongside the matrix rows.
@@ -3042,6 +3095,7 @@ server <- function(input, output, session) {
       req(hd)
 
       df <- as.data.frame(t(hd$mat_ordered))     # samples x features, in plotted order
+      colnames(df) <- hd$features_ordered
       df <- cbind(Sample = hd$sample_names_ordered, Group = hd$groups_ordered, df)
       rownames(df) <- NULL
       df
@@ -3234,6 +3288,7 @@ server <- function(input, output, session) {
                     "Invalid component number"))
       tryCatch({
         mixOmics::plotLoadings(model, block = "X", comp = input$plsr_loadings_comp,
+                                 name.var = feature_labels(colnames(model$X)),
                                method = "median", size.name = 0.5,
                                title = paste("Loadings - Component", input$plsr_loadings_comp))
       }, error = function(e) {
@@ -3262,6 +3317,7 @@ server <- function(input, output, session) {
       req(df)
 
       plot_df <- head(df, 30)
+      plot_df$Variable <- feature_labels(plot_df$Variable)
       plot_df$Variable <- factor(plot_df$Variable, levels = rev(plot_df$Variable))
 
       ggplot(plot_df, aes(x = Variable, y = VIP)) +
@@ -3530,7 +3586,7 @@ server <- function(input, output, session) {
       if (model$ncomp >= 1) {
         tryCatch({
           mixOmics::plotLoadings(model, block = "X", comp = 1, method = "median",
-                                 size.name = 0.5, name.var = NULL)
+                                 size.name = 0.5, name.var = feature_labels(colnames(model$X)))
         }, error = function(e) {
           validate(need(FALSE, "Loadings plot error: try enlarging plot window or reduce number of features"))
         })
@@ -3543,7 +3599,7 @@ server <- function(input, output, session) {
       if (model$ncomp >= 2) {
         tryCatch({
           mixOmics::plotLoadings(model, block = "X", comp = 2, method = "median",
-                                 size.name = 0.5, name.var = NULL)
+                                 size.name = 0.5, name.var = feature_labels(colnames(model$X)))
         }, error = function(e) {
           validate(need(FALSE, "Loadings plot error: try enlarging plot window or reduce number of features"))
         })
@@ -3572,7 +3628,7 @@ server <- function(input, output, session) {
       mat_scaled <- scale(mat)
       mat_scaled[!is.finite(mat_scaled)] <- 0
       mat_t <- t(mat_scaled)
-      rownames(mat_t) <- substring(rownames(mat_t), 1, 40)
+      rownames(mat_t) <- feature_labels(all_selected_features)
 
       row_sideColors <- NULL
       feature_colors <- NULL
@@ -3704,6 +3760,7 @@ server <- function(input, output, session) {
 
       col_name <- if (!is.null(input$plsr_y_col) && input$plsr_y_col != "") input$plsr_y_col else "Y"
       df <- as.data.frame(t(hd$mat_ordered))     # samples x features, in plotted order
+      colnames(df) <- hd$features_ordered
       df <- cbind(Sample = hd$sample_names_ordered, df)
       df[[col_name]] <- hd$y_ordered
       df <- df[, c("Sample", col_name, setdiff(names(df), c("Sample", col_name)))]
@@ -4058,7 +4115,7 @@ server <- function(input, output, session) {
           model <- final_splsda_model()
           if (model$ncomp >= 1) {
             mixOmics::plotLoadings(model, comp = 1, method = "median", contrib = "max", 
-                                   size.name = 0.5, name.var = NULL)
+                                   size.name = 0.5, name.var = feature_labels(colnames(model$X)))
           }
         }, finally = {
           dev.off()
@@ -4077,7 +4134,7 @@ server <- function(input, output, session) {
           model <- final_splsda_model()
           if (model$ncomp >= 2) {
             mixOmics::plotLoadings(model, comp = 2, method = "median", contrib = "max",
-                                   size.name = 0.5, name.var = NULL)
+                                   size.name = 0.5, name.var = feature_labels(colnames(model$X)))
           }
         }, finally = {
           dev.off()
@@ -4204,6 +4261,7 @@ server <- function(input, output, session) {
         pdf(file, width = input$pdf_width, height = input$pdf_height)
         tryCatch({
           mixOmics::plotLoadings(model, block = "X", comp = input$plsr_loadings_comp,
+                                 name.var = feature_labels(colnames(model$X)),
                                  method = "median", size.name = 0.5,
                                  title = paste("Loadings - Component", input$plsr_loadings_comp))
         }, finally = { dev.off() })
@@ -4286,7 +4344,7 @@ server <- function(input, output, session) {
           model <- final_splsr_model()
           if (model$ncomp >= 1) {
             mixOmics::plotLoadings(model, block = "X", comp = 1, method = "median",
-                                   size.name = 0.5, name.var = NULL)
+                                   size.name = 0.5, name.var = feature_labels(colnames(model$X)))
           }
         }, finally = { dev.off() })
       },
@@ -4302,7 +4360,7 @@ server <- function(input, output, session) {
           model <- final_splsr_model()
           if (model$ncomp >= 2) {
             mixOmics::plotLoadings(model, block = "X", comp = 2, method = "median",
-                                   size.name = 0.5, name.var = NULL)
+                                   size.name = 0.5, name.var = feature_labels(colnames(model$X)))
           }
         }, finally = { dev.off() })
       },
