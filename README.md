@@ -3,7 +3,7 @@
 A Shiny application for statistical analysis of metabolomics data, combining univariate and multivariate methods with optional feature metadata support. Developed at Metatoul-AgromiX, Toulouse University. Based on mixOmics and ggpubr packages. Initial script from G. Marti, shiny using vibe coding.
 Directly compatible with MSNet outputs.
 
-**Use it online (nothing to install):** https://guillaumem31.github.io/msnet-stat-student/
+**Use it online (nothing to install):** https://guillaumem31.github.io/metabostat-student/
 
 - R runs inside your web browser (Shinylive / webR, including `mixOmics`): no R installation needed.
 - The first load takes 30-90 s (R and the packages are downloaded into the browser), later visits are faster.
