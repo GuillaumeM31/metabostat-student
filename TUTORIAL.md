@@ -176,7 +176,7 @@ Raw mass spectrometry peak intensities cannot be compared directly without prope
 - **Missing Value Imputation**:
   - `Min/10`: Replaces zeros/NAs with one-tenth of the lowest measured intensity (proxy for the limit of detection).
 - **Normalization (Sample-wise)**:
-  - `TSS (Total Sum Scaling)`: Divides each feature intensity by the sum of all intensities in that sample, correcting for biological dilution differences.
+  - `TSS (Total Sum Scaling)`: Divides each feature intensity by the sum of all intensities in that sample, correcting for biological dilution differences. The result is rescaled to the median total signal of the dataset, so intensities keep their original magnitude (otherwise `Log10(x+1)` of tiny fractions would be almost linear and CLR pseudo-counts would dominate).
 - **Transformation (Feature-wise)**:
   - `Log10(x+1)`: Compresses the extreme dynamic range of MS detectors and normalizes right-skewed distributions.
 - **Scaling (Feature-wise)**:

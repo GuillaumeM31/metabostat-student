@@ -1,7 +1,15 @@
-# MetaboStat: an MSNet plug-in
+# MetaboStat: an MSNet plug-in (Student edition)
 
-A Shiny application for statistical analysis of metabolomics data, combining univariate and multivariate methods with optional feature metadata support. Developed at Metatoul-AgromiX, Toulouse University. Based on mixomics and ggpubR packages. Initial script from G. Marti, shiny using vibe coding. 
+A Shiny application for statistical analysis of metabolomics data, combining univariate and multivariate methods with optional feature metadata support. Developed at Metatoul-AgromiX, Toulouse University. Based on mixOmics and ggpubr packages. Initial script from G. Marti, shiny using vibe coding.
 Directly compatible with MSNet outputs.
+
+**Use it online (nothing to install):** https://guillaumem31.github.io/msnet-stat-student/
+
+- R runs inside your web browser (Shinylive / webR, including `mixOmics`): no R installation needed.
+- The first load takes 30-90 s (R and the packages are downloaded into the browser), later visits are faster.
+- **Your data never leaves your computer**: files are processed locally in the browser.
+- Pick an *Example dataset* in the sidebar and click *Load example data* to try it.
+- Heavy computations (tuning, repeated cross-validation) are slower in the browser than in desktop R; the default number of repeats is reduced accordingly. For large datasets, run the app in desktop R (see below).
 
 ## Features
 
@@ -65,6 +73,8 @@ Open the project in RStudio, then:
   source("run_app.R")
   ```
 
+The application itself is `app/app.R` (the same file is used by the desktop and by the browser version).
+
 ### From System File Explorer:
 - **macOS**: Double-click `run_mac.command`.
 - **Windows**: Double-click `run_windows.bat`.
@@ -117,8 +127,39 @@ Guillaume Marti (Toulouse University)
 
 Contributors: Claude AI (Shiny application and metadata enhancement support)
 
+## Disclaimer
+
+> **For educational purposes only.** This application was developed for teaching
+> metabolomics statistics to Master students. It is provided "as is", without
+> warranty of any kind, express or implied. The authors do not guarantee the accuracy,
+> completeness or fitness for a particular purpose of the results and cannot be held
+> liable for any consequence of their use. It is not a validated tool (GLP/GMP, clinical
+> or regulatory use): always verify results independently.
+
+## Changes in v1.5.0 (browser version, review of the statistics)
+
+- **Browser (standalone) version** with Shinylive, example datasets and a *Load example data* button.
+- **PCA is now always centered** (it was not centered with the default scaling "None", so PC1 mostly captured the mean).
+- **NIPALS imputation works** (it called an argument that no longer exists and silently fell back to min/10); only missing cells are replaced.
+- **TSS keeps the intensity scale** (rescaled to the median total signal): `log10(x+1)` is no longer almost linear and CLR pseudo-counts no longer dominate. CLR uses a data-driven pseudo-count.
+- **Scaling is computed on the selected groups only**, and sPLS-DA / sPLS-R / tuning no longer apply an extra UV scaling on top of the method you chose.
+- The **grouping column, PLS-R response and numeric sample-index column are never treated as features** (they used to be normalized and analysed like metabolites).
+- **Leave-one-out cross-validation works** (PLS-DA / PLS-R), folds are limited to the smallest group size, and a **random seed** makes cross-validation, tuning and PERMANOVA reproducible.
+- **PERMANOVA uses the Euclidean distance** (the default Bray-Curtis is meaningless on scores with negative values).
+- **"sPLS-DA -> Univariate" no longer filters the multivariate models** (and vice versa); the univariate p-values stay adjusted over all tested features; cached models/tuning/performance are cleared when the data change.
+- Sortable p-value columns, correct sample names in exported tables, same figure on screen and in PDF for boxplots/volcano, Tukey letters for group names containing "-", decimal-comma files detected correctly.
+- Caveats are now shown in the app: PLS-DA PERMANOVA and AUROC are computed on training data (optimistic); pre-selecting features before cross-validation biases the error rate.
+
 ## License
 
-This project's own code is released under the CeCILL-B License, Copyright (c) 2025 Guillaume Marti.
+This project's own code is released under the CeCILL-B License (see [LICENSE](LICENSE) in English and [LICENCE-fr.txt](LICENCE-fr.txt) in French), Copyright (c) 2025-2026 Guillaume Marti, University of Toulouse.
 
 It depends on third-party R packages distributed under their own licenses, including mixOmics and ggpubr (GPL (≥ 2)). These are used as installed dependencies, not redistributed or modified, so they remain separately licensed and do not affect the CeCILL-B license of this code.
+
+
+## For maintainers
+
+- `app/app.R` is the application (plus the example data in `app/`).
+- `docs/` is the generated website served by GitHub Pages; do not edit it by hand.
+- After editing `app/app.R`: `Rscript build.R`, check locally with
+  `Rscript -e "httpuv::runStaticServer('docs')"`, then commit and push.

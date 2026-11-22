@@ -1,26 +1,36 @@
 #==============================================================================
-# Metabolomics Statistical Analysis_Metatoul-AgromiX
+# MetaboStat / MSnet-Stat - Student Edition
+# Metabolomics Statistical Analysis Platform (Metatoul-AgromiX)
 # Unified Shiny Application for Statistical Analysis of Metabolomics Data
 #
-# Version: 1.4.0 - Enhanced with Bidirectional Feature Filtering
-# Date: October 2025
-# 
+# Version: 1.5.0 - runs both in desktop R and in the browser (Shinylive / webR)
+# Date: November 2026
+#
 # Author: Guillaume Marti (Toulouse University)
-# 
+#
 # Contributors:
 #   - Claude AI for shiny application and metadata enhancement
 #
-# License: MIT License
-# Copyright (c) 2025 Guillaume Marti
+# License: CeCILL-B (BSD-like, compatible with French law) - see LICENSE
+# Copyright (c) 2025-2026 Guillaume Marti, University of Toulouse
+#
+# DISCLAIMER: for educational purposes only. Provided "as is", without any
+# warranty; the authors do not guarantee the accuracy of the results and accept
+# no liability for their use. Not a validated tool (GLP/GMP, clinical or
+# regulatory use).
 #
 # Citation:
 # If you use this software in your research, please cite:
 # G.Marti. (2025). Metabolomics Statistical Analysis Platform - AgromiX.
 # Zenodo repository: 10.5281/zenodo.17319833
 #
-#==============================================================================   
+#==============================================================================
 
 options(shiny.maxRequestSize = 200 * 1024^2)  # 200 Mo
+
+# TRUE when the app runs inside the browser (Shinylive / webR): slower
+# computations and no multi-core, so heavy defaults are reduced.
+IS_WEBR <- identical(R.version$os, "emscripten")
 
 # --- Load libraries ---
 suppressPackageStartupMessages({
@@ -49,9 +59,54 @@ suppressPackageStartupMessages({
 # USER INTERFACE
 #==============================================================================
 
+# Downloads: fetch the file inside the page and save it as a blob. In Shinylive
+# (webR in the browser), a plain link click opens a new tab that can miss the
+# in-browser R server and saves an HTML page instead of the PDF/CSV.
+download_js <- "
+document.addEventListener('click', async function (e) {
+  var a = e.target.closest('a.shiny-download-link');
+  if (!a) return;
+  e.preventDefault();
+  e.stopPropagation();
+  var href = a.getAttribute('href');
+  if (!href || a.classList.contains('disabled')) {
+    alert('The file is not ready yet: load and validate your data first.');
+    return;
+  }
+  try {
+    var r = await fetch(href);
+    var type = r.headers.get('content-type') || '';
+    if (!r.ok || type.indexOf('text/html') === 0) throw new Error('the app could not create the file (check that the analysis has been run)');
+    var cd = r.headers.get('content-disposition') || '';
+    var m = cd.match(/filename\\*?=(?:UTF-8'')?\"?([^\";]+)\"?/i);
+    var name = m ? decodeURIComponent(m[1]) : 'download';
+    var url = URL.createObjectURL(await r.blob());
+    var tmp = document.createElement('a');
+    tmp.href = url; tmp.download = name; tmp.style.display = 'none';
+    document.body.appendChild(tmp); tmp.click(); tmp.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
+  } catch (err) {
+    alert('Download failed: ' + err.message);
+  }
+}, true);
+"
+
+# Example datasets shipped next to the app (relative to the app folder).
+EXAMPLES <- list(
+  "Cannabis chemotypes (LC-MS, 18 samples, with feature metadata)" =
+    list(data = "StatTableNEGPOS.csv", meta = "NodesNEGPOS.csv", group = "Class"),
+  "Stevia - untargeted (798 features, missing values)" =
+    list(data = "UntargetedStevia.csv", meta = NULL, group = "Class"),
+  "Stevia - semi-targeted steviol glycosides" =
+    list(data = "Semitargeted-SGs.csv", meta = NULL, group = "Class"),
+  "Stevia - quantified steviol glycosides (ppm)" =
+    list(data = "QuantificationSGsStd-ppm.csv", meta = NULL, group = "Class")
+)
+
 ui <- fluidPage(
   theme = shinytheme("flatly"),
   useShinyjs(),
+  tags$head(tags$script(HTML(download_js))),
   
   titlePanel(
     div(
@@ -65,6 +120,7 @@ ui <- fluidPage(
       width = 3,
       
       h4("1. Data Input"),
+      uiOutput("example_ui"),
       fileInput("file1", "Statistical Data CSV", accept = c(".csv", ".txt")),
       radioButtons("sep", "Separator:", 
                    choices = c("Comma" = ",", "Semicolon" = ";", "Tab" = "\t"),
@@ -88,17 +144,15 @@ ui <- fluidPage(
       
       h4("3. Preprocessing"),
       selectInput("impute_method", "Missing value imputation:",
-                  choices = c("None (remove vars with many NAs)" = "none",
+                  choices = c("None (remaining NAs set to 0)" = "none",
                               "Min/10 (detection limit)" = "min10",
                               "NIPALS (mixOmics)" = "nipals")),
-      conditionalPanel(
-        condition = "input.impute_method != 'none'",
-        sliderInput("max_na_prop", "Max % missing allowed:", 
-                    min = 10, max = 80, value = 50, step = 5,
-                    post = "%")
-      ),
+      sliderInput("max_na_prop", "Remove variables with more than this % missing:",
+                  min = 10, max = 80, value = 50, step = 5,
+                  post = "%"),
       selectInput("norm_method", "Normalization:",
-                  choices = c("None" = "none", "TSS" = "tss")),
+                  choices = c("None" = "none",
+                              "TSS (rescaled to median total signal)" = "tss")),
       selectInput("trans_method", "Transformation:",
                   choices = c("None" = "none",
                               "Log10(x+1)" = "log10",
@@ -176,6 +230,8 @@ ui <- fluidPage(
       ),
 
       tags$hr(),
+      numericInput("seed", "Random seed (cross-validation, tuning, PERMANOVA):",
+                   value = 123, min = 1, step = 1),
       numericInput("pdf_width", "PDF width:", value = 10, min = 5, max = 20),
       numericInput("pdf_height", "PDF height:", value = 8, min = 5, max = 20)
     ),
@@ -202,11 +258,13 @@ ui <- fluidPage(
                   h4(icon("upload"), " Step 1: Data Upload")),
               div(class = "panel-body",
                   tags$ol(
+                    tags$li(strong("Try it first:"), " pick an example dataset and click 'Load example data' (Cannabis chemotypes, Stevia)"),
                     tags$li(strong("Main Data File:"), " Upload your metabolomics data matrix as CSV/TXT"),
                     tags$ul(
                       tags$li("Rows = samples, Columns = features + one grouping column"),
                       tags$li("Numeric feature values with optional missing data"),
-                      tags$li("Example: Sample1, Sample2... | Group | Feature1, Feature2...")
+                      tags$li("Example: Sample1, Sample2... | Group | Feature1, Feature2..."),
+                      tags$li("The grouping column, the PLS-R response and a numeric sample-index column are never used as features")
                     ),
                     tags$li(strong("Select Separator:"), " The app auto-detects, but verify comma/semicolon/tab"),
                     tags$li(strong("Choose Grouping Column:"), " Select which column contains your experimental groups"),
@@ -232,9 +290,9 @@ ui <- fluidPage(
                       tags$li("Min/10: Replace with detection limit estimate"),
                       tags$li("NIPALS: Multivariate imputation (recommended for < 50% missing)")
                     ),
-                    tags$li(strong("Normalization:"), " TSS (Total Sum Scaling) for sample-to-sample variation"),
+                    tags$li(strong("Normalization:"), " TSS (Total Sum Scaling, rescaled to the median total signal so the data stay in intensity units) for sample-to-sample variation"),
                     tags$li(strong("Transformation:"), " Log10 or CLR for variance stabilization"),
-                    tags$li(strong("Scaling:"), " UV (Unit Variance) or Pareto for feature weighting"),
+                    tags$li(strong("Scaling:"), " UV (Unit Variance) or Pareto for feature weighting. It is computed on the selected groups only, so excluding a group re-scales the data"),
                     tags$li(tags$em("Tip:"), " Typical untargeted metabolomics workflow: Min/10 → Log10 → Pareto (or UV)")
                   )
               )
@@ -247,7 +305,7 @@ ui <- fluidPage(
                   tags$ul(
                     tags$li("Select 2+ groups to include in your analysis"),
                     tags$li("Useful for pairwise comparisons or excluding control/outlier groups"),
-                    tags$li("Click 'Apply' to update all analyses with selected groups"),
+                    tags$li("Analyses follow your selection; cached models / tuning / performance results are cleared whenever the data change"),
                     tags$li("Use 'Reset' to return to all groups")
                   )
               )
@@ -323,6 +381,7 @@ ui <- fluidPage(
               div(class = "panel-body",
                   tags$ul(
                     tags$li(strong("Data Quality:"), " Always check the 'Data' tab to verify import success"),
+                    tags$li(strong("Reproducibility:"), " cross-validation, tuning and PERMANOVA use the random seed set in the sidebar"),
                     tags$li(strong("Sample Size:"), " Minimum 4-5 samples per group recommended"),
                     tags$li(strong("Feature Selection:"), " Start with univariate → filter → multivariate workflow"),
                     tags$li(strong("Validation:"), " Check the Quality metrics / Performance panels (PLS-DA, sPLS-DA, PLS-R, sPLS-R) before interpreting any supervised model - a poor error rate/BER or a negative Q2 means the model is not trustworthy, however good the scores plot looks"),
@@ -404,6 +463,7 @@ ui <- fluidPage(
           DT::dataTableOutput("metadata_preview"),
           tags$hr(),
           h5("Preprocessed data preview"),
+          helpText(textOutput("processed_note")),
           DT::dataTableOutput("data_preview_processed"),
           downloadButton("download_processed_data", "Download")
         ),
@@ -412,13 +472,15 @@ ui <- fluidPage(
           "Univariate",
           # Filter status indicator
           conditionalPanel(
-            condition = "output.splsda_filter_active",
+            condition = "output.uv_filter_active",
             div(class = "alert alert-warning", style = "margin-bottom: 15px;",
                 icon("filter"), 
                 strong(" Filtered Mode: "),
-                "Showing only features selected by sPLS-DA (",
-                textOutput("splsda_filter_count", inline = TRUE),
-                " features). ",
+                "Showing only features selected by ",
+                textOutput("uv_filter_source", inline = TRUE),
+                " (",
+                textOutput("uv_filter_count", inline = TRUE),
+                " features). P-values are still adjusted over all tested features. ",
                 actionButton("clear_splsda_filter_top", "Show All Features", 
                              class = "btn-warning btn-xs")
             )
@@ -482,6 +544,7 @@ ui <- fluidPage(
                        div(class = "well well-sm", style = "background-color: #f0f8ff;",
                            h5(icon("filter"), " Feature Filtering for Multivariate Analysis"),
                            p("Send these significant features to sPLS-DA for focused biomarker discovery."),
+                           helpText("Caution: selecting features with the same samples that are then used for cross-validation makes the error rate over-optimistic (selection bias). Use it for exploration, and confirm biomarkers on independent samples."),
                            actionButton("send_to_splsda", 
                                         "Use Significant Features in sPLS-DA", 
                                         class = "btn-info",
@@ -624,7 +687,7 @@ ui <- fluidPage(
                        conditionalPanel(
                          condition = "input.plsda_cv_method == 'Mfold'",
                          numericInput("plsda_folds", "Folds:", value = 5, min = 2, max = 10),
-                         numericInput("plsda_nrepeat", "Repeats:", value = 50, min = 10, max = 200)
+                         numericInput("plsda_nrepeat", "Repeats:", value = if (IS_WEBR) 10 else 50, min = 3, max = 200)
                        ),
                        actionButton("run_plsda_perf", "Performance", class = "btn-info"),
                        tags$hr(),
@@ -637,8 +700,11 @@ ui <- fluidPage(
               ),
               tags$hr(),
               fluidRow(
-                column(6, verbatimTextOutput("plsda_permanova")),
                 column(6,
+                       helpText("PERMANOVA on the PLS-DA scores. Caution: PLS-DA scores are built to separate the groups, so this p-value is circular (over-optimistic); rely on the cross-validated error rate above."),
+                       verbatimTextOutput("plsda_permanova")),
+                column(6,
+                       helpText("AUROC is computed on the training data (optimistic); the cross-validated error rate/BER above is the honest estimate."),
                        numericInput("plsda_auc_comp", "Comp AUC:", value = 1, min = 1, max = 15),
                        plotOutput("plsda_auc", height = "400px"),
                        downloadButton("download_plsda_auc", "PDF")
@@ -789,7 +855,7 @@ ui <- fluidPage(
                        conditionalPanel(
                          condition = "input.plsr_cv_method == 'Mfold'",
                          numericInput("plsr_folds", "Folds:", value = 5, min = 2, max = 10),
-                         numericInput("plsr_nrepeat", "Repeats:", value = 50, min = 10, max = 200)
+                         numericInput("plsr_nrepeat", "Repeats:", value = if (IS_WEBR) 10 else 50, min = 3, max = 200)
                        ),
                        selectInput("plsr_perf_criterion", "Criterion:",
                                    choices = c("MSEP" = "MSEP", "R2" = "R2", "Q2.total" = "Q2.total")),
@@ -914,6 +980,16 @@ ui <- fluidPage(
         )
       )
     )
+  ),
+
+  div(
+    class = "text-muted text-center small",
+    style = "margin: 25px 0 15px 0; padding-top: 10px; border-top: 1px solid #ddd;",
+    HTML("&#9888; For educational purposes only. This software is provided \"as is\", without warranty of any kind: the authors do not guarantee the accuracy of the results and accept no liability for their use. Always verify results independently before using them in research, publications or regulated contexts."),
+    tags$br(),
+    "\u00a9 2025-2026 Guillaume Marti, University of Toulouse - ",
+    tags$a("CeCILL-B licence", href = "https://cecill.info/licences/Licence_CeCILL-B_V1-en.html", target = "_blank"),
+    if (IS_WEBR) " - Your data are processed locally in your browser and are never uploaded."
   )
 )
 
@@ -921,18 +997,58 @@ ui <- fluidPage(
 # UTILS
 #==============================================================================
 
+# Separator detected from the header line: the candidate (tab, ;, ,) that occurs
+# most often wins. The header is used on purpose: data lines may contain decimal
+# commas ("1,5;2,5"), which would otherwise be mistaken for column separators.
+detect_separator <- function(path) {
+  header <- readLines(path, n = 1, encoding = "UTF-8", warn = FALSE)
+  if (length(header) == 0) return(",")
+  counts <- c("\t" = 0, ";" = 0, "," = 0)
+  for (sep in names(counts)) {
+    counts[sep] <- lengths(regmatches(header, gregexpr(sep, header, fixed = TRUE)))
+  }
+  if (max(counts) == 0) "," else names(counts)[which.max(counts)]
+}
+
+read_table_file <- function(path, sep) {
+  fread(path, header = TRUE, sep = sep, data.table = FALSE, encoding = "UTF-8",
+        check.names = FALSE, integer64 = "double", stringsAsFactors = FALSE)
+}
+
+# Grouping column to pre-select: a column named like a group / class / treatment,
+# otherwise the second text column (the first one is usually the sample ID).
+guess_group_col <- function(df) {
+  text_cols <- names(df)[!vapply(df, is.numeric, logical(1))]
+  if (length(text_cols) == 0) return(names(df)[1])
+  by_name <- text_cols[grepl("^(class|group|treatment|condition|type|chemotype|genotype|phenotype)",
+                             text_cols, ignore.case = TRUE)]
+  if (length(by_name) > 0) return(by_name[1])
+  if (length(text_cols) >= 2) text_cols[2] else text_cols[1]
+}
+
+# Numeric columns used as features: the grouping column, the PLS-R response and
+# a leading sample-index column (unique integers) are NOT features - otherwise
+# they would be normalized, scaled and analysed like metabolites.
+get_feature_cols <- function(df, group_col = NULL, y_col = NULL) {
+  numeric_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  excluded <- c(group_col, y_col)
+  if (ncol(df) > 0) {
+    first <- df[[1]]
+    if (is.numeric(first) && !anyNA(first) && !anyDuplicated(first) && all(first == round(first))) {
+      excluded <- c(excluded, names(df)[1])
+    }
+  }
+  setdiff(numeric_cols, excluded)
+}
+
 # Pick the metadata column whose values best match the data's feature (column)
 # names, instead of always defaulting to the first metadata column. Datasets
 # commonly carry several ID-like columns (e.g. "AnnoID" vs "Alignment ID") and
 # only one of them lines up with the feature names actually used in the data.
-guess_feature_id_col <- function(metadata_df, raw_data) {
+guess_feature_id_col <- function(metadata_df, feature_names) {
   default_col <- names(metadata_df)[1]
 
-  if (is.null(raw_data)) return(default_col)
-
-  numeric_cols <- sapply(raw_data, is.numeric)
-  feature_names <- names(raw_data)[numeric_cols]
-  if (length(feature_names) == 0) return(default_col)
+  if (is.null(feature_names) || length(feature_names) == 0) return(default_col)
 
   match_rates <- sapply(metadata_df, function(col) {
     mean(feature_names %in% as.character(col))
@@ -940,6 +1056,44 @@ guess_feature_id_col <- function(metadata_df, raw_data) {
 
   best_col <- names(which.max(match_rates))
   if (length(best_col) > 0 && match_rates[best_col] > 0) best_col else default_col
+}
+
+# Replace missing values by min/10 of their column (detection-limit estimate)
+impute_min10 <- function(X) {
+  X <- as.data.frame(X)
+  for (j in seq_along(X)) {
+    v <- X[[j]]
+    if (anyNA(v)) {
+      col_min <- min(v, na.rm = TRUE)
+      X[[j]][is.na(v)] <- if (col_min > 0) col_min / 10 else abs(col_min) / 10 + 0.01
+    }
+  }
+  X
+}
+
+# Scaling of a samples x features table. UV / Pareto drop constant features.
+scale_features <- function(X, method) {
+  M <- as.matrix(X)
+  if (method %in% c("uv", "pareto")) {
+    sds <- apply(M, 2, sd, na.rm = TRUE)
+    ok <- is.finite(sds) & sds > 1e-10
+    if (sum(ok) < 2) stop("not enough variables with variance for ", toupper(method), " scaling")
+    M <- M[, ok, drop = FALSE]
+    sds <- sds[ok]
+    M <- sweep(M, 2, colMeans(M, na.rm = TRUE), "-")
+    # Pareto = mean-centering and division by sqrt(sd)
+    M <- sweep(M, 2, if (method == "uv") sds else sqrt(sds), "/")
+  } else if (method == "center") {
+    M <- sweep(M, 2, colMeans(M, na.rm = TRUE), "-")
+  }
+  M[!is.finite(M)] <- 0
+  as.data.frame(M)
+}
+
+# Number of cross-validation folds that every class (or sample) can support
+cv_folds <- function(requested, groups = NULL, n = NULL) {
+  limit <- if (!is.null(groups)) min(table(groups)) else floor(n / 2)
+  max(2, min(requested, limit))
 }
 
 # Pulls the per-component mean/sd out of one measure of a mixOmics perf.pls
@@ -960,8 +1114,13 @@ server <- function(input, output, session) {
   
   rv <- reactiveValues(
     raw_data = NULL,
+    data_path = NULL,
+    data_sep = NULL,
     metadata = NULL,
+    meta_path = NULL,
+    meta_sep = NULL,
     groups = NULL,
+    group_col = NULL,
     data_validated = FALSE,
     metadata_validated = FALSE,
     plsda_perf = NULL,
@@ -972,338 +1131,340 @@ server <- function(input, output, session) {
     splsr_final_perf = NULL,
     selected_groups = NULL,
     groups_applied = FALSE,
-    X_abundance = NULL,
-    # NEW: Feature filtering
-    filtered_features = NULL,  # Stores filtered feature list
-    filter_source = NULL       # Tracks source: "univariate", "splsda", or NULL
+    # Feature filtering. The two directions are kept separate so that the
+    # "sPLS-DA -> Univariate" view never changes the multivariate models (and
+    # vice versa).
+    mv_features = NULL,   # restricts the multivariate analyses (set from the Univariate tab)
+    uv_features = NULL,   # restricts the univariate view (set from sPLS-DA / sPLS-R)
+    uv_source = NULL      # "sPLS-DA" or "sPLS-R"
   )
-  
+
+  # Clear every cached model / tuning / performance result (they are only valid
+  # for the data, groups, preprocessing and feature set they were computed on).
+  reset_results <- function() {
+    rv$plsda_perf <- NULL
+    rv$splsda_tune_result <- NULL
+    rv$splsda_final_perf <- NULL
+    rv$plsr_perf <- NULL
+    rv$splsr_tune_result <- NULL
+    rv$splsr_final_perf <- NULL
+  }
+
+  # Reproducible cross-validation / tuning / permutations
+  apply_seed <- function() {
+    s <- suppressWarnings(as.integer(input$seed))
+    if (length(s) == 1 && !is.na(s)) set.seed(s)
+  }
+
   # Output for conditional panel
   output$metadata_loaded <- reactive({
     !is.null(rv$metadata) && rv$metadata_validated
   })
   outputOptions(output, "metadata_loaded", suspendWhenHidden = FALSE)
-  
-  # Update status indicators for filtering
-  output$univ_filter_active <- reactive({
-    !is.null(rv$filtered_features) && rv$filter_source == "univariate"
-  })
+
+  # Status indicators for filtering
+  output$univ_filter_active <- reactive({ !is.null(rv$mv_features) })
   outputOptions(output, "univ_filter_active", suspendWhenHidden = FALSE)
-  
+
+  output$uv_filter_active <- reactive({ !is.null(rv$uv_features) })
+  outputOptions(output, "uv_filter_active", suspendWhenHidden = FALSE)
+
   output$splsda_filter_active <- reactive({
-    !is.null(rv$filtered_features) && rv$filter_source == "splsda"
+    !is.null(rv$uv_features) && identical(rv$uv_source, "sPLS-DA")
   })
   outputOptions(output, "splsda_filter_active", suspendWhenHidden = FALSE)
 
   output$splsr_filter_active <- reactive({
-    !is.null(rv$filtered_features) && rv$filter_source == "splsr"
+    !is.null(rv$uv_features) && identical(rv$uv_source, "sPLS-R")
   })
   outputOptions(output, "splsr_filter_active", suspendWhenHidden = FALSE)
 
-  output$univ_filter_count <- renderText({
-    if(!is.null(rv$filtered_features)) {
-      as.character(length(rv$filtered_features))
-    } else {
-      "0"
+  output$univ_filter_count <- renderText(as.character(length(rv$mv_features)))
+  output$uv_filter_count <- renderText(as.character(length(rv$uv_features)))
+  output$uv_filter_source <- renderText(if (is.null(rv$uv_source)) "" else rv$uv_source)
+
+  #----------------------------------------------------------------------------
+  # File import (separator auto-detected from the header line)
+  #----------------------------------------------------------------------------
+
+  # Called whenever a new statistical data table is read (upload, example,
+  # separator change). A new table always has to be validated again.
+  set_main_data <- function(df, path, sep, group_hint = NULL) {
+    names(df) <- make.unique(ifelse(is.na(names(df)) | names(df) == "", "V", names(df)))
+    rv$raw_data <- df
+    rv$data_path <- path
+    rv$data_sep <- sep
+    rv$data_validated <- FALSE
+    rv$metadata_validated <- FALSE
+    rv$groups <- NULL
+    rv$group_col <- NULL
+    rv$selected_groups <- NULL
+    rv$mv_features <- NULL
+    rv$uv_features <- NULL
+    rv$uv_source <- NULL
+    reset_results()
+
+    num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+    group_guess <- if (!is.null(group_hint) && group_hint %in% names(df)) group_hint else guess_group_col(df)
+    updateRadioButtons(session, "sep", selected = sep)
+    updateSelectInput(session, "group_col", choices = names(df), selected = group_guess)
+    updateSelectInput(session, "plsr_y_col", choices = c("None" = "", num_cols))
+
+    # If metadata was already uploaded, re-guess the best-matching ID column
+    # now that the data's feature names are known too.
+    if (!is.null(rv$metadata)) {
+      updateSelectInput(session, "feature_id_col", choices = names(rv$metadata),
+                        selected = guess_feature_id_col(rv$metadata, num_cols))
     }
-  })
-  
-  output$splsda_filter_count <- renderText({
-    if(!is.null(rv$filtered_features)) {
-      as.character(length(rv$filtered_features))
-    } else {
-      "0"
-    }
-  })
-  
-  # File import with improved tab detection
-  observeEvent(input$file1, {
-    req(input$file1)
-    
+  }
+
+  load_main_data <- function(path, group_hint = NULL) {
     tryCatch({
-      # Read first few lines to better detect separator
-      first_lines <- readLines(input$file1$datapath, n = 5, encoding = "UTF-8")
-      
-      # Count occurrences of different separators
-      tab_count <- sum(grepl("\t", first_lines))
-      semicolon_count <- sum(grepl(";", first_lines))
-      comma_count <- sum(grepl(",", first_lines))
-      
-      # Update separator based on which is most prevalent
-      if (tab_count > 0 && tab_count >= semicolon_count && tab_count >= comma_count) {
-        updateRadioButtons(session, "sep", selected = "\t")
-        actual_sep <- "\t"
-      } else if (semicolon_count > comma_count) {
-        updateRadioButtons(session, "sep", selected = ";")
-        actual_sep <- ";"
-      } else {
-        updateRadioButtons(session, "sep", selected = ",")
-        actual_sep <- ","
-      }
-      
-      # Try to read with detected separator first
-      df <- tryCatch({
-        fread(input$file1$datapath, header = TRUE, sep = actual_sep,
-              data.table = FALSE, encoding = "UTF-8", check.names = FALSE, integer64 = "double")
-      }, error = function(e) {
-        # If auto-detection fails, try with user-selected separator
-        fread(input$file1$datapath, header = TRUE, sep = input$sep,
-              data.table = FALSE, encoding = "UTF-8", check.names = FALSE, integer64 = "double")
-      })
-      
-      # Check if the data frame makes sense
+      sep <- detect_separator(path)
+      df <- tryCatch(read_table_file(path, sep),
+                     error = function(e) read_table_file(path, input$sep))
+
       if (ncol(df) < 2) {
         showNotification("File appears to have parsing issues. Please check the separator.", type = "warning")
       }
-      
       if (nrow(df) < 5) {
-        showNotification("File too small", type = "error")
-        return(NULL)
-      }
-      
-      rv$raw_data <- df
-      updateSelectInput(session, "group_col", choices = names(df))
-      updateSelectInput(session, "plsr_y_col",
-                        choices = c("None" = "", names(df)[sapply(df, is.numeric)]))
-
-      # If metadata was already uploaded, re-guess the best-matching ID column
-      # now that the data's feature names are known too.
-      if (!is.null(rv$metadata)) {
-        updateSelectInput(session, "feature_id_col", choices = names(rv$metadata),
-                          selected = guess_feature_id_col(rv$metadata, df))
+        showNotification("File too small (at least 5 samples are required)", type = "error")
+        return(invisible(FALSE))
       }
 
+      set_main_data(df, path, sep, group_hint)
       showNotification(paste("Data file loaded:", nrow(df), "rows,", ncol(df), "columns"), type = "message")
-
+      invisible(TRUE)
     }, error = function(e) {
       showNotification(paste("Error:", e$message), type = "error")
+      invisible(FALSE)
     })
-  })
-  
-  # Re-parse data when separator changes
-  observeEvent(input$sep, {
-    req(input$file1)
-    
-    tryCatch({
-      df <- fread(input$file1$datapath, header = TRUE, sep = input$sep,
-                  data.table = FALSE, encoding = "UTF-8", check.names = FALSE, integer64 = "double")
+  }
 
+  set_metadata <- function(md, path, sep) {
+    names(md) <- make.unique(ifelse(is.na(names(md)) | names(md) == "", "V", names(md)))
+    rv$metadata <- md
+    rv$meta_path <- path
+    rv$meta_sep <- sep
+
+    feature_names <- if (is.null(rv$raw_data)) NULL else names(rv$raw_data)[vapply(rv$raw_data, is.numeric, logical(1))]
+    numeric_cols <- names(md)[vapply(md, is.numeric, logical(1))]
+    character_cols <- names(md)[vapply(md, function(x) is.character(x) || is.factor(x), logical(1))]
+
+    updateRadioButtons(session, "meta_sep", selected = sep)
+    updateSelectInput(session, "feature_id_col", choices = names(md),
+                      selected = guess_feature_id_col(md, feature_names))
+    updateSelectInput(session, "heatmap_annotation_col", choices = c("None" = "", character_cols))
+    updateSelectInput(session, "volcano_size_col", choices = c("None" = "", numeric_cols))
+  }
+
+  load_metadata <- function(path) {
+    tryCatch({
+      sep <- detect_separator(path)
+      md <- tryCatch(read_table_file(path, sep),
+                     error = function(e) read_table_file(path, input$meta_sep))
+      if (ncol(md) < 2) {
+        showNotification("Metadata parsing issue detected. Please check the separator.", type = "warning")
+      }
+      set_metadata(md, path, sep)
+      showNotification(paste("Metadata file loaded:", nrow(md), "features,", ncol(md), "columns"), type = "message")
+      invisible(TRUE)
+    }, error = function(e) {
+      showNotification(paste("Metadata error:", e$message), type = "error")
+      invisible(FALSE)
+    })
+  }
+
+  observeEvent(input$file1, {
+    req(input$file1)
+    load_main_data(input$file1$datapath)
+  })
+
+  # Re-parse data when the user changes the separator by hand (the automatic
+  # update of the radio button after detection is ignored: same separator).
+  observeEvent(input$sep, {
+    req(rv$data_path)
+    if (identical(input$sep, rv$data_sep)) return(NULL)
+
+    tryCatch({
+      df <- read_table_file(rv$data_path, input$sep)
       if (ncol(df) < 2) {
         showNotification("Parsing issue detected. Try a different separator.", type = "warning")
       } else {
-        rv$raw_data <- df
-        updateSelectInput(session, "group_col", choices = names(df))
-        updateSelectInput(session, "plsr_y_col",
-                          choices = c("None" = "", names(df)[sapply(df, is.numeric)]))
+        set_main_data(df, rv$data_path, input$sep)
         showNotification(paste("Data re-loaded with new separator:", nrow(df), "rows,", ncol(df), "columns"), type = "message")
       }
-      
     }, error = function(e) {
       showNotification(paste("Error with selected separator:", e$message), type = "error")
     })
   })
-  
-  # Metadata import with improved parsing
+
   observeEvent(input$metadata_file, {
     req(input$metadata_file)
-    
-    tryCatch({
-      # Read first few lines to detect separator
-      first_lines <- readLines(input$metadata_file$datapath, n = 5, encoding = "UTF-8")
-      
-      # Count occurrences of different separators
-      tab_count <- sum(grepl("\t", first_lines))
-      semicolon_count <- sum(grepl(";", first_lines))
-      comma_count <- sum(grepl(",", first_lines))
-      
-      # Update separator based on which is most prevalent
-      if (tab_count > 0 && tab_count >= semicolon_count && tab_count >= comma_count) {
-        updateRadioButtons(session, "meta_sep", selected = "\t")
-        actual_sep <- "\t"
-      } else if (semicolon_count > comma_count) {
-        updateRadioButtons(session, "meta_sep", selected = ";")
-        actual_sep <- ";"
-      } else {
-        updateRadioButtons(session, "meta_sep", selected = ",")
-        actual_sep <- ","
-      }
-      
-      # Try to read with detected separator
-      metadata_df <- tryCatch({
-        fread(input$metadata_file$datapath, header = TRUE, sep = actual_sep,
-              data.table = FALSE, encoding = "UTF-8", stringsAsFactors = FALSE, check.names = FALSE, integer64 = "double")
-      }, error = function(e) {
-        fread(input$metadata_file$datapath, header = TRUE, sep = input$meta_sep,
-              data.table = FALSE, encoding = "UTF-8", stringsAsFactors = FALSE, check.names = FALSE, integer64 = "double")
-      })
-      
-      if (ncol(metadata_df) < 2) {
-        showNotification("Metadata parsing issue detected. Please check the separator.", type = "warning")
-      }
-      
-      rv$metadata <- metadata_df
-      updateSelectInput(session, "feature_id_col", choices = names(metadata_df),
-                        selected = guess_feature_id_col(metadata_df, rv$raw_data))
-
-      # Update visualization options
-      numeric_cols <- names(metadata_df)[sapply(metadata_df, is.numeric)]
-      character_cols <- names(metadata_df)[sapply(metadata_df, is.character) | sapply(metadata_df, is.factor)]
-      
-      updateSelectInput(session, "heatmap_annotation_col", 
-                        choices = c("None" = "", character_cols))
-      updateSelectInput(session, "volcano_size_col", 
-                        choices = c("None" = "", numeric_cols))
-      
-      showNotification(paste("Metadata file loaded:", nrow(metadata_df), "features,", ncol(metadata_df), "columns"), type = "message")
-      
-    }, error = function(e) {
-      showNotification(paste("Metadata error:", e$message), type = "error")
-    })
+    load_metadata(input$metadata_file$datapath)
   })
-  
-  # Re-parse metadata when separator changes
-  observeEvent(input$meta_sep, {
-    req(input$metadata_file)
-    
-    tryCatch({
-      metadata_df <- fread(input$metadata_file$datapath, header = TRUE, sep = input$meta_sep,
-                           data.table = FALSE, encoding = "UTF-8", stringsAsFactors = FALSE, check.names = FALSE, integer64 = "double")
 
-      if (ncol(metadata_df) < 2) {
+  observeEvent(input$meta_sep, {
+    req(rv$meta_path)
+    if (identical(input$meta_sep, rv$meta_sep)) return(NULL)
+
+    tryCatch({
+      md <- read_table_file(rv$meta_path, input$meta_sep)
+      if (ncol(md) < 2) {
         showNotification("Metadata parsing issue. Try a different separator.", type = "warning")
       } else {
-        rv$metadata <- metadata_df
-        updateSelectInput(session, "feature_id_col", choices = names(metadata_df),
-                          selected = guess_feature_id_col(metadata_df, rv$raw_data))
-
-        # Update visualization options
-        numeric_cols <- names(metadata_df)[sapply(metadata_df, is.numeric)]
-        character_cols <- names(metadata_df)[sapply(metadata_df, is.character) | sapply(metadata_df, is.factor)]
-        
-        updateSelectInput(session, "heatmap_annotation_col", 
-                          choices = c("None" = "", character_cols))
-        updateSelectInput(session, "volcano_size_col", 
-                          choices = c("None" = "", numeric_cols))
-        
-        showNotification(paste("Metadata re-loaded:", nrow(metadata_df), "features,", ncol(metadata_df), "columns"), type = "message")
+        set_metadata(md, rv$meta_path, input$meta_sep)
+        showNotification(paste("Metadata re-loaded:", nrow(md), "features,", ncol(md), "columns"), type = "message")
       }
-      
     }, error = function(e) {
       showNotification(paste("Error with selected separator:", e$message), type = "error")
     })
   })
-  
+
+  # Example datasets shipped next to the app
+  output$example_ui <- renderUI({
+    available <- vapply(EXAMPLES, function(e) file.exists(e$data), logical(1))
+    if (!any(available)) return(NULL)
+    tagList(
+      selectInput("example_choice", "Example dataset:", choices = names(EXAMPLES)[available]),
+      actionButton("load_example", "Load example data", class = "btn-default btn-sm",
+                   style = "width: 100%; margin-bottom: 15px;")
+    )
+  })
+
+  observeEvent(input$load_example, {
+    ex <- EXAMPLES[[input$example_choice]]
+    req(ex, file.exists(ex$data))
+
+    if (isTRUE(load_main_data(ex$data, group_hint = ex$group))) {
+      if (!is.null(ex$meta) && file.exists(ex$meta)) {
+        load_metadata(ex$meta)
+      } else {
+        rv$metadata <- NULL
+        rv$meta_path <- NULL
+      }
+      # Validate once the group selector has been updated in the browser
+      shinyjs::delay(800, shinyjs::click("validate_data"))
+    }
+  })
+
   # Metadata matching check
   output$metadata_match_info <- renderPrint({
-    req(rv$raw_data, rv$metadata, input$feature_id_col)
-    
-    numeric_cols <- sapply(rv$raw_data, is.numeric)
-    feature_names <- names(rv$raw_data)[numeric_cols]
-    metadata_ids <- rv$metadata[[input$feature_id_col]]
-    
+    req(rv$raw_data, rv$metadata, input$feature_id_col, rv$group_col)
+
+    feature_names <- get_feature_cols(rv$raw_data, rv$group_col)
+    metadata_ids <- trimws(as.character(rv$metadata[[input$feature_id_col]]))
+
     n_features <- length(feature_names)
     n_metadata <- length(metadata_ids)
-    n_matched <- sum(feature_names %in% metadata_ids)
-    
+    n_matched <- sum(trimws(feature_names) %in% metadata_ids)
+
     cat("Data features:", n_features, "\n")
     cat("Metadata entries:", n_metadata, "\n")
     cat("Matched features:", n_matched, "\n")
     cat("Match percentage:", round(n_matched/n_features * 100, 1), "%\n")
-    
+    if (anyDuplicated(metadata_ids)) {
+      cat("Warning: duplicated IDs in the metadata (the first entry is used).\n")
+    }
+
     if(n_matched < n_features) {
-      unmatched <- feature_names[!feature_names %in% metadata_ids]
+      unmatched <- feature_names[!trimws(feature_names) %in% metadata_ids]
       cat("\nFirst 10 unmatched features:\n")
       cat(head(unmatched, 10), sep = ", ")
     }
   })
-  
+
   # Validation
   observeEvent(input$validate_data, {
     req(rv$raw_data, input$group_col)
-    
+
     tryCatch({
       groups <- factor(rv$raw_data[[input$group_col]])
-      
+
       if (length(levels(groups)) < 2) {
         showNotification("At least 2 groups required", type = "error")
         return(NULL)
       }
-      
-      numeric_cols <- sapply(rv$raw_data, is.numeric)
-      X_numeric <- rv$raw_data[, numeric_cols, drop = FALSE]
-      
-      if (ncol(X_numeric) < 2) {
-        showNotification("At least 2 variables required", type = "error")
+
+      feats <- get_feature_cols(rv$raw_data, input$group_col)
+      if (length(feats) < 2) {
+        showNotification("At least 2 numeric feature columns required", type = "error")
         return(NULL)
       }
-      
+
+      excluded_id <- setdiff(names(rv$raw_data)[vapply(rv$raw_data, is.numeric, logical(1))],
+                             c(feats, input$group_col))
+      if (length(excluded_id) > 0) {
+        showNotification(paste0("Column '", excluded_id[1],
+                                "' looks like a sample index (unique integers) and is not used as a feature."),
+                         type = "message", duration = 8)
+      }
+      if (anyNA(groups)) {
+        showNotification(paste(sum(is.na(groups)), "sample(s) without group are ignored."), type = "warning")
+      }
+      tab <- table(groups)
+      small <- names(tab)[tab < 3]
+      if (length(small) > 0) {
+        showNotification(paste("Groups with fewer than 3 samples (cross-validation will be unreliable):",
+                               paste(small, collapse = ", ")), type = "warning", duration = 10)
+      }
+
       rv$groups <- groups
+      rv$group_col <- input$group_col
       rv$selected_groups <- levels(groups)
       rv$data_validated <- TRUE
       rv$groups_applied <- FALSE
-      
+      rv$mv_features <- NULL
+      rv$uv_features <- NULL
+      rv$uv_source <- NULL
+      reset_results()
+
       # Validate metadata if present
       if(!is.null(rv$metadata) && !is.null(input$feature_id_col)) {
         rv$metadata_validated <- TRUE
         showNotification("Data and metadata validated", type = "message")
       } else {
-        showNotification(paste("Validated:", nrow(X_numeric), "samples,", 
-                               ncol(X_numeric), "variables"), type = "message")
+        rv$metadata_validated <- FALSE
+        showNotification(paste("Validated:", nrow(rv$raw_data), "samples,",
+                               length(feats), "variables"), type = "message")
       }
-      
+
     }, error = function(e) {
       showNotification(paste("Error:", e$message), type = "error")
     })
   })
-  
-  # Get matched metadata with improved matching
+
+  # Get matched metadata (one row per data feature, NA when the feature has no
+  # metadata; duplicated metadata IDs are resolved to the first entry)
   matched_metadata <- reactive({
-    if(is.null(rv$metadata) || !rv$metadata_validated || is.null(input$feature_id_col)) {
+    if(is.null(rv$metadata) || !rv$metadata_validated || is.null(rv$raw_data) ||
+       is.null(rv$group_col) || is.null(input$feature_id_col) || input$feature_id_col == "") {
       return(NULL)
     }
-    
-    numeric_cols <- sapply(rv$raw_data, is.numeric)
-    feature_names <- names(rv$raw_data)[numeric_cols]
-    
+
+    feature_names <- get_feature_cols(rv$raw_data, rv$group_col)
     metadata_df <- rv$metadata
-    
-    # Clean feature names for better matching (remove spaces, special characters)
-    clean_feature_names <- trimws(feature_names)
     clean_metadata_ids <- trimws(as.character(metadata_df[[input$feature_id_col]]))
-    
-    # Create a mapping
-    metadata_df$feature_name_clean <- clean_metadata_ids
-    
-    # Create a dataframe with matched metadata
-    matched_df <- data.frame(
-      feature_name = feature_names,
-      feature_name_clean = clean_feature_names,
-      stringsAsFactors = FALSE
-    )
-    
-    # Try exact matching first
-    matched_df <- merge(matched_df, metadata_df, 
-                        by.x = "feature_name_clean", 
-                        by.y = "feature_name_clean", 
-                        all.x = TRUE)
-    
-    # Set row names to original feature names
-    rownames(matched_df) <- matched_df$feature_name
-    
+
+    idx <- match(trimws(feature_names), clean_metadata_ids)
+    matched_df <- metadata_df[idx, , drop = FALSE]
+    matched_df$feature_name <- feature_names
+    rownames(matched_df) <- feature_names
+
     # Report matching statistics
-    n_matched <- sum(!is.na(matched_df[[input$feature_id_col]]))
+    n_matched <- sum(!is.na(idx))
     if(n_matched == 0) {
-      showNotification("Warning: No features matched between data and metadata. Check feature ID column selection.", 
+      showNotification("Warning: No features matched between data and metadata. Check feature ID column selection.",
                        type = "warning", duration = 10)
     } else if(n_matched < length(feature_names) * 0.5) {
-      showNotification(paste("Warning: Only", n_matched, "out of", length(feature_names), 
-                             "features matched with metadata."), 
+      showNotification(paste("Warning: Only", n_matched, "out of", length(feature_names),
+                             "features matched with metadata."),
                        type = "warning", duration = 10)
     }
-    
+
     return(matched_df)
   })
-  
+
   # Dynamic UI for group selection
   output$group_selector_ui <- renderUI({
     req(rv$groups)
@@ -1394,244 +1555,242 @@ server <- function(input, output, session) {
     
     return(groups_filt)
   })
-  
-  # Preprocessing
-  X_processed <- reactive({
-    req(rv$data_validated, rv$raw_data)
-    
+
+  # Sample names (first text column that is not the grouping column), used as
+  # row names so that plots and exported tables show the real sample IDs.
+  sample_ids <- reactive({
+    req(rv$raw_data, rv$group_col)
+    df <- rv$raw_data
+    candidates <- setdiff(names(df)[!vapply(df, is.numeric, logical(1))], rv$group_col)
+    ids <- if (length(candidates) > 0) as.character(df[[candidates[1]]]) else as.character(seq_len(nrow(df)))
+    missing_id <- is.na(ids) | ids == ""
+    ids[missing_id] <- paste0("Sample_", which(missing_id))
+    make.unique(ids)
+  })
+
+  # Preprocessing, step 1 (sample-wise, independent of the group selection):
+  # missing values -> normalization -> transformation. The grouping column, the
+  # PLS-R response and any sample-index column are never treated as features.
+  # Returns the transformed matrix plus the normalized (untransformed) abundances
+  # used for the true fold change in the volcano plot.
+  X_pre <- reactive({
+    req(rv$data_validated, rv$raw_data, rv$group_col)
+
     tryCatch({
-      numeric_cols <- sapply(rv$raw_data, is.numeric)
-      X <- rv$raw_data[, numeric_cols, drop = FALSE]
-      
-      if (ncol(X) == 0) {
-        showNotification("No numeric variables found", type = "error")
+      feats <- get_feature_cols(rv$raw_data, rv$group_col, input$plsr_y_col)
+      if (length(feats) < 2) {
+        showNotification("At least 2 numeric feature columns are required", type = "error")
         return(NULL)
       }
-      
+
+      X <- rv$raw_data[, feats, drop = FALSE]
+      rownames(X) <- sample_ids()
+
       na_prop <- colMeans(is.na(X))
       n_vars_before <- ncol(X)
-      max_na_allowed <- if(!is.null(input$max_na_prop)) input$max_na_prop/100 else 0.5
-      impute_method <- if(!is.null(input$impute_method)) input$impute_method else "none"
-      
-      if (impute_method == "none") {
-        X <- X[, na_prop < max_na_allowed, drop = FALSE]
-        if (ncol(X) < 2) {
-          showNotification("Too many missing values. Need at least 2 valid variables.", type = "error")
-          return(NULL)
-        }
-        X[is.na(X)] <- 0
-      } else if (impute_method == "min10") {
-        X <- X[, na_prop < max_na_allowed, drop = FALSE]
-        if (ncol(X) < 2) {
-          showNotification("Too many variables with excessive missing values.", type = "error")
-          return(NULL)
-        }
-        for (i in 1:ncol(X)) {
-          if (any(is.na(X[, i]))) {
-            col_min <- min(X[, i], na.rm = TRUE)
-            impute_val <- if (col_min > 0) col_min / 10 else abs(col_min) / 10 + 0.01
-            X[is.na(X[, i]), i] <- impute_val
+      max_na_allowed <- if (!is.null(input$max_na_prop)) input$max_na_prop / 100 else 0.5
+      impute_method <- if (!is.null(input$impute_method)) input$impute_method else "none"
+
+      X <- X[, na_prop <= max_na_allowed, drop = FALSE]
+      if (ncol(X) < 2) {
+        showNotification("Too many missing values. Need at least 2 valid variables.", type = "error")
+        return(NULL)
+      }
+      if (ncol(X) < n_vars_before) {
+        showNotification(paste("Removed", n_vars_before - ncol(X), "variables with too many missing values"),
+                         type = "message")
+      }
+
+      if (anyNA(X)) {
+        if (impute_method == "none") {
+          X[is.na(X)] <- 0
+        } else {
+          X_min10 <- impute_min10(X)
+          if (impute_method == "min10") {
+            X <- X_min10
+          } else {
+            # NIPALS: only the missing cells are replaced (observed values are
+            # kept); non-positive imputed values fall back to min/10.
+            X_matrix <- as.matrix(X)
+            ncomp_nipals <- max(1, min(5, nrow(X_matrix) - 2, ncol(X_matrix) - 1))
+            imputed <- withProgress(message = "NIPALS imputation in progress...", value = 0.5, {
+              tryCatch(
+                suppressWarnings(suppressMessages(mixOmics::impute.nipals(X_matrix, ncomp = ncomp_nipals))),
+                error = function(e) NULL
+              )
+            })
+            if (is.null(imputed)) {
+              showNotification("NIPALS failed, using min/10 fallback", type = "warning")
+              X <- X_min10
+            } else {
+              imputed <- as.matrix(imputed)
+              bad <- is.na(X_matrix) & !(is.finite(imputed) & imputed > 0)
+              imputed[bad] <- as.matrix(X_min10)[bad]
+              dimnames(imputed) <- dimnames(X_matrix)
+              X <- as.data.frame(imputed)
+            }
           }
         }
-        showNotification(paste("Imputed missing values with min/10"), type = "message")
-      } else if (impute_method == "nipals") {
-        X <- X[, na_prop < max_na_allowed, drop = FALSE]
-        if (ncol(X) < 2) {
-          showNotification("Too many variables with excessive missing values.", type = "error")
-          return(NULL)
-        }
-        withProgress(message = "NIPALS imputation in progress...", value = 0.5, {
-          tryCatch({
-            X_matrix <- as.matrix(X)
-            ncomp_nipals <- min(nrow(X_matrix), ncol(X_matrix), 10)
-            nipals_result <- mixOmics::nipals(X_matrix, ncomp = ncomp_nipals, 
-                                              reconst = TRUE, max.iter = 500)
-            X <- as.data.frame(nipals_result$rec)
-            colnames(X) <- colnames(X_matrix)
-            showNotification(paste("NIPALS imputation completed"), type = "message")
-          }, error = function(e) {
-            showNotification(paste("NIPALS failed, using min/10 fallback"), type = "warning")
-            for (i in 1:ncol(X)) {
-              if (any(is.na(X[, i]))) {
-                col_min <- min(X[, i], na.rm = TRUE)
-                impute_val <- if (col_min > 0) col_min / 10 else abs(col_min) / 10 + 0.01
-                X[is.na(X[, i]), i] <- impute_val
-              }
-            }
-          })
-        })
       }
-      
-      n_vars_after <- ncol(X)
-      if (n_vars_after < n_vars_before) {
-        showNotification(paste("Removed", n_vars_before - n_vars_after, "variables"), type = "message")
+
+      M <- as.matrix(X)
+
+      # Normalization / transformation need non-negative intensities
+      if (any(M < 0) && (input$norm_method == "tss" || input$trans_method != "none")) {
+        showNotification("Negative values found: they are set to 0 before normalization / transformation.",
+                         type = "warning")
+        M[M < 0] <- 0
       }
-      
-      # Normalization
+
+      # Normalization: TSS, rescaled to the median total signal so that the data
+      # stay in intensity units (otherwise log10(x+1) of fractions ~ 1e-4 is
+      # almost the identity and CLR pseudo-counts dominate the signal)
       if (input$norm_method == "tss") {
-        row_sums <- rowSums(X, na.rm = TRUE)
-        if (!any(row_sums == 0)) {
-          X <- sweep(X, 1, row_sums, FUN = "/")
+        row_sums <- rowSums(M)
+        if (any(row_sums <= 0)) {
+          showNotification("TSS skipped: at least one sample has a total signal of 0.", type = "warning")
+        } else {
+          M <- sweep(M, 1, row_sums, FUN = "/") * stats::median(row_sums)
         }
       }
-      
-      # Save unscaled normalized abundance (strictly positive values) for true Fold-Change calculation
-      X_unscaled_abundances <- X
-      
+
+      # Unscaled normalized abundances: true fold change in the volcano plot
+      M_abund <- M
+
       # Transformation
       if (input$trans_method == "log10") {
-        X_matrix <- as.matrix(X)
-        X_matrix <- log10(X_matrix + 1)
-        X_matrix[is.infinite(X_matrix)] <- 0
-        X <- as.data.frame(X_matrix)
+        M <- log10(M + 1)
       } else if (input$trans_method == "clr") {
-        X_matrix <- as.matrix(X)
-        X_matrix <- X_matrix + 0.01
-        X_transformed <- mixOmics::logratio.transfo(X_matrix, logratio = "CLR")
-        X <- as.data.frame(X_transformed)
+        positive <- M[M > 0]
+        offset <- if (any(M <= 0) && length(positive) > 0) min(positive) / 2 else 0
+        res <- mixOmics::logratio.transfo(M, logratio = "CLR", offset = offset)
+        M <- matrix(as.numeric(res), nrow = nrow(M), dimnames = dimnames(M))
       }
-      
-      # Scaling
-      if (input$scale_method == "none") {
-        X <- X
-      } else if (input$scale_method == "center") {
-        X_matrix <- as.matrix(X)
-        X_scaled <- scale(X_matrix, center = TRUE, scale = FALSE)
-        X <- as.data.frame(X_scaled)
-      } else if (input$scale_method == "uv") {
-        X_matrix <- as.matrix(X)
-        col_sd <- apply(X_matrix, 2, sd, na.rm = TRUE)
-        valid_cols <- col_sd > 1e-10
-        if (sum(valid_cols) < 2) {
-          showNotification("Not enough variables with variance for UV scaling", type = "warning")
-          X <- as.data.frame(X_matrix)
-        } else {
-          X_matrix <- X_matrix[, valid_cols, drop = FALSE]
-          X_scaled <- scale(X_matrix, center = TRUE, scale = TRUE)
-          X_scaled[!is.finite(X_scaled)] <- 0
-          X <- as.data.frame(X_scaled)
-        }
-      } else if (input$scale_method == "pareto") {
-        X_matrix <- as.matrix(X)
-        col_sd <- apply(X_matrix, 2, sd, na.rm = TRUE)
-        valid_cols <- !is.na(col_sd) & col_sd > 1e-10
-        if (sum(valid_cols) < 2) {
-          showNotification("Not enough variables with variance for Pareto scaling", type = "warning")
-          X <- as.data.frame(X_matrix)
-        } else {
-          X_matrix <- X_matrix[, valid_cols, drop = FALSE]
-          col_mean <- colMeans(X_matrix, na.rm = TRUE)
-          col_sd_valid <- col_sd[valid_cols]
-          # Native Pareto scaling: mean-centering and scaling by sqrt(sd)
-          X_scaled <- sweep(sweep(X_matrix, 2, col_mean, "-"), 2, sqrt(col_sd_valid), "/")
-          X_scaled[!is.finite(X_scaled)] <- 0
-          X <- as.data.frame(X_scaled)
-        }
-      }
-      
-      # Final check: remove any columns with NaN or Inf
-      X_matrix <- as.matrix(X)
-      valid_cols <- apply(X_matrix, 2, function(col) all(is.finite(col)))
-      X <- X[, valid_cols, drop = FALSE]
-      
-      if (ncol(X) < 2) {
+
+      # Remove any column with NaN or Inf
+      valid_cols <- apply(M, 2, function(col) all(is.finite(col)))
+      M <- M[, valid_cols, drop = FALSE]
+      M_abund <- M_abund[, valid_cols, drop = FALSE]
+
+      if (ncol(M) < 2) {
         showNotification("Preprocessing resulted in too few valid variables", type = "error")
         return(NULL)
       }
-      
-      valid_feature_names <- colnames(X)
-      unscaled_df <- as.data.frame(X_unscaled_abundances[, valid_feature_names, drop = FALSE])
-      rv$unscaled_data <- unscaled_df
-      
-      return(as.data.frame(X))
-      
+
+      list(trans = as.data.frame(M), abund = as.data.frame(M_abund))
+
     }, error = function(e) {
       showNotification(paste("Preprocessing error:", e$message), type = "error")
       return(NULL)
     })
   })
-  
-  # Filtered data for analysis (with selected groups only)
+
+  # Preprocessed data, all samples (Data tab preview / download only)
+  X_processed <- reactive({
+    pre <- X_pre()
+    req(pre)
+    tryCatch(
+      scale_features(pre$trans, input$scale_method),
+      error = function(e) {
+        showNotification(paste("Scaling error:", e$message), type = "error")
+        NULL
+      }
+    )
+  })
+
+  # Data used by every analysis: selected groups only, and scaled on THOSE
+  # samples (UV / Pareto / centering must not be influenced by excluded groups).
   X_filtered <- reactive({
-    req(X_processed(), rv$groups, rv$selected_groups)
-    
+    pre <- X_pre()
+    req(pre, rv$groups, rv$selected_groups)
+
     selected_idx <- rv$groups %in% rv$selected_groups
-    
+
     if(sum(selected_idx) < 4) {
       showNotification("Not enough samples in selected groups (minimum 4)", type = "error")
       return(NULL)
     }
-    
-    X_filt <- X_processed()[selected_idx, , drop = FALSE]
-    return(X_filt)
+
+    tryCatch(
+      scale_features(pre$trans[selected_idx, , drop = FALSE], input$scale_method),
+      error = function(e) {
+        showNotification(paste("Scaling error:", e$message), type = "warning")
+        NULL
+      }
+    )
   })
-  
-  # NEW: Get the active feature set (filtered or all)
+
+  # Multivariate feature set (all features, or those sent from the Univariate tab)
   active_features <- reactive({
     req(X_filtered())
-    
-    if(!is.null(rv$filtered_features) && length(rv$filtered_features) > 0) {
-      # Return only filtered features that exist in the data
-      available_features <- intersect(rv$filtered_features, colnames(X_filtered()))
-      
-      if(length(available_features) < 2) {
-        showNotification("Not enough filtered features available. Using all features.", 
-                         type = "warning")
-        return(colnames(X_filtered()))
+
+    if(!is.null(rv$mv_features) && length(rv$mv_features) > 0) {
+      available_features <- intersect(rv$mv_features, colnames(X_filtered()))
+
+      if(length(available_features) >= 2) {
+        return(available_features)
       }
-      
-      return(available_features)
-    } else {
-      # Return all features
-      return(colnames(X_filtered()))
+      showNotification("Not enough filtered features available. Using all features.",
+                       type = "warning")
     }
+    colnames(X_filtered())
   })
-  
-  # NEW: Feature-filtered data for analyses
+
+  # Feature-filtered data for the multivariate analyses
   X_feature_filtered <- reactive({
     req(X_filtered(), active_features())
-    
+
     X_filtered()[, active_features(), drop = FALSE]
   })
-  
-  # Unscaled data subset for accurate Fold-Change computation in Volcano plots
-  X_unscaled_filtered <- reactive({
-    req(rv$unscaled_data, rv$groups, rv$selected_groups, active_features())
-    selected_idx <- rv$groups %in% rv$selected_groups
-    avail_cols <- intersect(active_features(), colnames(rv$unscaled_data))
-    rv$unscaled_data[selected_idx, avail_cols, drop = FALSE]
+
+  # Number of components that can really be computed on the current data
+  ncomp_eff <- reactive({
+    X <- X_feature_filtered()
+    req(X, input$ncomp_mv)
+    max(1, min(input$ncomp_mv, nrow(X) - 1, ncol(X)))
   })
-  
-  # NEW: Button observers for feature filtering
-  
+
+  # Unscaled (normalized) abundances of the selected samples, for the true Fold-Change
+  X_unscaled_filtered <- reactive({
+    pre <- X_pre()
+    req(pre, rv$groups, rv$selected_groups)
+    selected_idx <- rv$groups %in% rv$selected_groups
+    pre$abund[selected_idx, , drop = FALSE]
+  })
+
+  # Cached results are only valid for the data they were computed on
+  observeEvent(X_feature_filtered(), { reset_results() }, ignoreInit = TRUE)
+  observeEvent(input$ncomp_mv, { rv$plsda_perf <- NULL; rv$plsr_perf <- NULL }, ignoreInit = TRUE)
+  observeEvent(list(rv$splsda_tune_result, input$splsda_mode, input$splsda_ncomp_manual,
+                    input$splsda_keepx_manual), { rv$splsda_final_perf <- NULL }, ignoreInit = TRUE)
+  observeEvent(list(rv$splsr_tune_result, input$splsr_mode, input$splsr_ncomp_manual,
+                    input$splsr_keepx_manual, input$plsr_y_col), { rv$splsr_final_perf <- NULL }, ignoreInit = TRUE)
+
+  #----------------------------------------------------------------------------
+  # Feature filtering (cross-analysis)
+  #----------------------------------------------------------------------------
+
   # Send ANOVA results to sPLS-DA
   observeEvent(input$send_to_splsda, {
-    req(filtered_univariate_results())
-    
-    sig_features <- filtered_univariate_results()$Variable
-    
+    sig_features <- significant_features_all()
+
     if(length(sig_features) < 2) {
       showNotification("At least 2 significant features required", type = "error")
       return(NULL)
     }
-    
-    rv$filtered_features <- sig_features
-    rv$filter_source <- "univariate"
-    
-    # Clear any existing sPLS-DA tuning results to force re-tuning
-    rv$splsda_tune_result <- NULL
-    
+
+    rv$mv_features <- sig_features
+
     showNotification(
-      paste("sPLS-DA will now use", length(sig_features), 
-            "significant features from ANOVA (p <", input$pval_threshold, ")"),
+      paste("The multivariate analyses will now use the", length(sig_features),
+            "significant features from the univariate tests (p <", input$pval_threshold, ")"),
       type = "message",
       duration = 5
     )
-    
-    # Optionally switch to Multivariate tab
+
     updateTabsetPanel(session, "main_tabs", selected = "Multivariate")
   })
-  
+
   # Send sPLS-DA features to Univariate
   observeEvent(input$send_to_univariate, {
     req(final_splsda_model())
@@ -1642,7 +1801,7 @@ server <- function(input, output, session) {
       # Get all selected features from all components
       all_selected_features <- character()
       for (i in 1:model$ncomp) {
-        selected_i <- selectVar(model, comp = i)
+        selected_i <- mixOmics::selectVar(model, comp = i)
         all_selected_features <- c(all_selected_features, selected_i$name)
       }
       all_selected_features <- unique(all_selected_features)
@@ -1652,8 +1811,8 @@ server <- function(input, output, session) {
         return(NULL)
       }
       
-      rv$filtered_features <- all_selected_features
-      rv$filter_source <- "splsda"
+      rv$uv_features <- all_selected_features
+      rv$uv_source <- "sPLS-DA"
       
       showNotification(
         paste("Univariate analysis will now focus on", length(all_selected_features), 
@@ -1662,7 +1821,6 @@ server <- function(input, output, session) {
         duration = 5
       )
       
-      # Optionally switch to Univariate tab
       updateTabsetPanel(session, "main_tabs", selected = "Univariate")
       
     }, error = function(e) {
@@ -1679,7 +1837,7 @@ server <- function(input, output, session) {
 
       all_selected_features <- character()
       for (i in 1:model$ncomp) {
-        selected_i <- selectVar(model, comp = i)$X
+        selected_i <- mixOmics::selectVar(model, comp = i)$X
         all_selected_features <- c(all_selected_features, selected_i$name)
       }
       all_selected_features <- unique(all_selected_features)
@@ -1689,8 +1847,8 @@ server <- function(input, output, session) {
         return(NULL)
       }
 
-      rv$filtered_features <- all_selected_features
-      rv$filter_source <- "splsr"
+      rv$uv_features <- all_selected_features
+      rv$uv_source <- "sPLS-R"
 
       showNotification(
         paste("Univariate analysis will now focus on", length(all_selected_features),
@@ -1706,25 +1864,28 @@ server <- function(input, output, session) {
     })
   })
 
-  # Clear filters (multiple buttons for same action)
-  clear_filter <- function() {
-    rv$filtered_features <- NULL
-    rv$filter_source <- NULL
-    showNotification("Filter cleared. Using all features.", type = "message")
+  # Clear filters (several buttons for the same action)
+  clear_mv_filter <- function() {
+    rv$mv_features <- NULL
+    showNotification("Filter cleared. The multivariate analyses use all features.", type = "message")
+  }
+  clear_uv_filter <- function() {
+    rv$uv_features <- NULL
+    rv$uv_source <- NULL
+    showNotification("Filter cleared. The univariate analysis shows all features.", type = "message")
   }
 
-  observeEvent(input$clear_univ_filter, { clear_filter() })
-  observeEvent(input$clear_univ_filter_top, { clear_filter() })
-  observeEvent(input$clear_splsda_filter, { clear_filter() })
-  observeEvent(input$clear_splsda_filter_top, { clear_filter() })
-  observeEvent(input$clear_splsr_filter, { clear_filter() })
+  observeEvent(input$clear_univ_filter, { clear_mv_filter() })
+  observeEvent(input$clear_univ_filter_top, { clear_mv_filter() })
+  observeEvent(input$clear_splsda_filter, { clear_uv_filter() })
+  observeEvent(input$clear_splsda_filter_top, { clear_uv_filter() })
+  observeEvent(input$clear_splsr_filter, { clear_uv_filter() })
   
   # Data preview
   output$data_summary <- renderPrint({
     req(rv$data_validated, rv$groups)
     
-    numeric_cols <- sapply(rv$raw_data, is.numeric)
-    X <- rv$raw_data[, numeric_cols, drop = FALSE]
+    X <- rv$raw_data[, get_feature_cols(rv$raw_data, rv$group_col, input$plsr_y_col), drop = FALSE]
     
     cat("Total samples:", nrow(X), "\n")
     cat("Total variables:", ncol(X), "\n")
@@ -1767,12 +1928,14 @@ server <- function(input, output, session) {
     req(X_processed())
     head(X_processed(), 20)
   }, options = list(scrollX = TRUE))
+  output$processed_note <- renderText(
+    "Preview scaled over all samples. Each analysis re-scales the data on the selected groups only.")
   
   output$download_processed_data <- downloadHandler(
     filename = function() { "processed_data.csv" },
     content = function(file) {
       req(X_processed(), rv$groups)
-      df_export <- cbind(Group = rv$groups, X_processed())
+      df_export <- cbind(Sample = rownames(X_processed()), Group = rv$groups, X_processed())
       write.csv(df_export, file, row.names = FALSE)
     },
     contentType = "text/csv"
@@ -1795,12 +1958,14 @@ server <- function(input, output, session) {
           ") and", n_samples, "samples")
   })
   
-  # Univariate tests - UPDATED to use X_feature_filtered
+  # Univariate tests: always computed on ALL features of the selected samples, so
+  # the multiple-testing correction is not weakened when the view is restricted
+  # to features selected by sPLS-DA / sPLS-R.
   univariate_results <- reactive({
-    req(X_feature_filtered(), groups_filtered())
+    req(X_filtered(), groups_filtered())
     
     withProgress(message = "Univariate tests...", value = 0, {
-      X <- X_feature_filtered()  # CHANGED from X_filtered()
+      X <- X_filtered()
       groups <- groups_filtered()
       
       results <- map_df(names(X), function(var_name) {
@@ -1831,10 +1996,22 @@ server <- function(input, output, session) {
         arrange(Adjusted_P_Value)
     })
   })
-  
+
+  # Features below the p-value threshold (whatever the view filter)
+  significant_features_all <- reactive({
+    req(univariate_results())
+    univariate_results() %>% filter(Adjusted_P_Value <= input$pval_threshold) %>% pull(Variable)
+  })
+
+  # Rows shown in the Univariate tab: significant features, or - when features
+  # were sent from sPLS-DA / sPLS-R - those features whatever their p-value
   filtered_univariate_results <- reactive({
     req(univariate_results())
-    univariate_results() %>% filter(Adjusted_P_Value <= input$pval_threshold)
+    if (!is.null(rv$uv_features)) {
+      univariate_results() %>% filter(Variable %in% rv$uv_features)
+    } else {
+      univariate_results() %>% filter(Adjusted_P_Value <= input$pval_threshold)
+    }
   })
   
   output$univariate_table <- DT::renderDataTable({
@@ -1850,14 +2027,19 @@ server <- function(input, output, session) {
       results_df <- cbind(results_df, metadata_info)
     }
     
-    results_df %>%
-      mutate(across(where(is.numeric), ~formatC(.x, format = "e", digits = 3)))
-  }, selection = 'single', options = list(pageLength = 15, scrollX = TRUE))
+    DT::formatSignif(
+      DT::datatable(as.data.frame(results_df), selection = 'single', rownames = FALSE,
+                    options = list(pageLength = 15, scrollX = TRUE)),
+      columns = intersect(c("P_Value", "Adjusted_P_Value"), names(results_df)), digits = 3)
+  })
   
   output$filtering_stats <- renderPrint({
     req(univariate_results(), filtered_univariate_results())
     cat("Variables tested:", nrow(univariate_results()), "\n")
-    cat("Significant variables:", nrow(filtered_univariate_results()), "\n")
+    cat("Significant variables (adjusted p <=", input$pval_threshold, "):", length(significant_features_all()), "\n")
+    if (!is.null(rv$uv_features)) {
+      cat("Variables shown (selected by ", rv$uv_source, "): ", nrow(filtered_univariate_results()), "\n", sep = "")
+    }
   })
   
   # Enhanced Heatmap with metadata annotation - single source of truth for the
@@ -1866,18 +2048,19 @@ server <- function(input, output, session) {
   # cim() is run once headlessly here (to read back the rowInd/colInd it computed)
   # and re-run with the identical, deterministic arguments wherever it is drawn.
   univ_heatmap_ordered <- reactive({
-    req(filtered_univariate_results(), X_feature_filtered(), groups_filtered())
+    req(filtered_univariate_results(), X_filtered(), groups_filtered())
 
     if (nrow(filtered_univariate_results()) < 2) return(NULL)
 
     n_features <- min(input$n_heatmap_features, nrow(filtered_univariate_results()))
     top_vars <- filtered_univariate_results()$Variable[1:n_features]
 
-    X_df <- X_feature_filtered()
+    X_df <- X_filtered()
     mat <- as.matrix(X_df[, top_vars, drop = FALSE])
     mat <- scale(mat)
+    mat[!is.finite(mat)] <- 0
     mat_t <- t(mat)                      # features (rows) x samples (cols)
-    rownames(mat_t) <- substring(rownames(mat_t), 1, 12)
+    rownames(mat_t) <- substring(rownames(mat_t), 1, 20)
 
     # Row (feature) side colors from metadata, in the SAME (pre-cluster) order
     # as mat_t's rows - cim() reorders these itself alongside the matrix rows.
@@ -1976,7 +2159,7 @@ server <- function(input, output, session) {
 
   # Enhanced volcano plot with size based on metadata - UPDATED to use X_feature_filtered
   volcano_data <- reactive({
-    req(X_feature_filtered(), groups_filtered(), input$volcano_group1, input$volcano_group2)
+    req(X_filtered(), groups_filtered(), input$volcano_group1, input$volcano_group2)
     
     if (input$volcano_group1 == input$volcano_group2) {
       return(NULL)
@@ -1990,7 +2173,7 @@ server <- function(input, output, session) {
     }
     
     withProgress(message = "Volcano plot...", value = 0, {
-      X <- X_feature_filtered()  # CHANGED from X_filtered()
+      X <- X_filtered()
       X_unscaled <- tryCatch(X_unscaled_filtered(), error = function(e) NULL)
       groups <- groups_filtered()
       
@@ -2054,6 +2237,12 @@ server <- function(input, output, session) {
             TRUE ~ "NS"
           )
         )
+
+      # Features sent from sPLS-DA / sPLS-R: restrict the view (the p-values were
+      # adjusted over all tested features above)
+      if (!is.null(rv$uv_features)) {
+        results <- results[results$Variable %in% rv$uv_features, , drop = FALSE]
+      }
       
       # Add metadata for sizing if available
       if(!is.null(matched_metadata()) && !is.null(input$volcano_size_col) && 
@@ -2081,9 +2270,7 @@ server <- function(input, output, session) {
     })
   })
   
-  output$volcano_plot <- renderPlot({
-    req(volcano_data())
-    
+  volcano_gg <- function() {
     data <- volcano_data()
     
     p <- ggplot(data, aes(x = log2FC, y = negLog10P, color = Significance)) +
@@ -2095,7 +2282,7 @@ server <- function(input, output, session) {
       theme_minimal()
     
     # Add points with variable sizes if metadata is available
-    if("point_size" %in% names(data)) {
+    if("point_size" %in% names(data) && length(unique(data$point_size)) > 1) {
       p <- p + geom_point(aes(size = point_size), alpha = 0.6) +
         scale_size_continuous(range = input$volcano_size_range, 
                               name = input$volcano_size_col,
@@ -2107,11 +2294,18 @@ server <- function(input, output, session) {
     if (input$volcano_label && input$volcano_n_labels > 0) {
       sig_data <- data[data$Significance != "NS", ]
       sig_data <- sig_data[order(sig_data$adj_pvalue), ]
-      sig_data <- sig_data[1:min(input$volcano_n_labels, nrow(sig_data)), ]
-      p <- p + geom_text_repel(data = sig_data, aes(label = Variable), size = 3)
+      sig_data <- sig_data[seq_len(min(input$volcano_n_labels, nrow(sig_data))), ]
+      if (nrow(sig_data) > 0) {
+        p <- p + geom_text_repel(data = sig_data, aes(label = Variable), size = 3)
+      }
     }
     
     p
+  }
+
+  output$volcano_plot <- renderPlot({
+    req(volcano_data())
+    volcano_gg()
   })
   
   significant_volcano_results <- reactive({
@@ -2132,59 +2326,56 @@ server <- function(input, output, session) {
       results_df <- cbind(results_df, size_info)
     }
     
-    results_df %>%
-      mutate(across(where(is.numeric), ~formatC(.x, digits = 3)))
-  }, selection = 'single', options = list(pageLength = 10, scrollX = TRUE))
+    DT::formatSignif(
+      DT::datatable(as.data.frame(results_df), selection = 'single', rownames = FALSE,
+                    options = list(pageLength = 10, scrollX = TRUE)),
+      columns = intersect(c("log2FC", "pvalue", "adj_pvalue"), names(results_df)), digits = 3)
+  })
   
   selected_volcano_var <- reactive({
     req(input$volcano_table_rows_selected)
     as.character(significant_volcano_results()[input$volcano_table_rows_selected, "Variable"])
   })
   
-  output$volcano_boxplot <- renderPlot({
-    req(selected_volcano_var(), X_feature_filtered(), groups_filtered())
-    
+  volcano_boxplot_gg <- function() {
     var_name <- selected_volcano_var()
     X_unscaled <- tryCatch(X_unscaled_filtered(), error = function(e) NULL)
-    X_df <- if (!is.null(X_unscaled) && var_name %in% colnames(X_unscaled)) X_unscaled else X_feature_filtered()
+    has_unscaled <- !is.null(X_unscaled) && var_name %in% colnames(X_unscaled)
+    X_df <- if (has_unscaled) X_unscaled else X_filtered()
     plot_data <- data.frame(Group = groups_filtered(), Value = X_df[[var_name]])
     plot_data <- plot_data[plot_data$Group %in% c(input$volcano_group1, input$volcano_group2), ]
     plot_data <- plot_data[complete.cases(plot_data), ]
     plot_data$Group <- factor(plot_data$Group)
     
-    y_lab <- if (!is.null(X_unscaled) && var_name %in% colnames(X_unscaled)) "Abundance (unscaled)" else "Value"
+    y_lab <- if (has_unscaled) "Abundance (unscaled)" else "Value"
     
     ggboxplot(plot_data, x = "Group", y = "Value", fill = "Group",
               palette = c("blue", "red"), title = paste(var_name),
               ylab = y_lab) +
       stat_compare_means(method = if(input$use_nonparametric) "wilcox.test" else "t.test") +
       theme_minimal() + theme(legend.position = "none")
+  }
+
+  output$volcano_boxplot <- renderPlot({
+    req(selected_volcano_var(), X_filtered(), groups_filtered())
+    volcano_boxplot_gg()
   })
   
-  # Boxplot/Violin - UPDATED to use X_feature_filtered
+  # Boxplot / violin of the selected feature
   selected_univ_var <- reactive({
     req(input$univariate_table_rows_selected)
     as.character(filtered_univariate_results()[input$univariate_table_rows_selected, "Variable"])
   })
-  
-  output$univariate_boxplot <- renderPlot({
-    req(selected_univ_var(), X_feature_filtered(), groups_filtered())
-    
-    if(length(selected_univ_var()) == 0) {
-      validate(need(FALSE, "Please select a variable from the table above"))
-    }
-    
+
+  univ_boxplot_gg <- function() {
     var_name <- selected_univ_var()
-    X_df <- X_feature_filtered()  # CHANGED from X_filtered()
+    X_df <- X_filtered()
     plot_data <- data.frame(
       Group = groups_filtered(),
       Value = X_df[[var_name]]
     )
     plot_data <- plot_data[complete.cases(plot_data), ]
-    
-    if(nrow(plot_data) == 0) {
-      validate(need(FALSE, "No data available for selected variable"))
-    }
+    validate(need(nrow(plot_data) > 0, "No data available for selected variable"))
     
     n_groups <- length(levels(plot_data$Group))
     
@@ -2195,57 +2386,60 @@ server <- function(input, output, session) {
         labs(title = paste("Violin plot:", var_name), x = "", y = "Value") +
         theme_minimal(base_size = 14) +
         theme(legend.position = "none")
-      
-      if (input$add_points) {
-        p <- p + geom_jitter(width = 0.2, alpha = 0.6, size = 2)
-      }
     } else {
       p <- ggboxplot(plot_data, x = "Group", y = "Value", fill = "Group",
                      palette = mixOmics::color.mixo(1:n_groups),
                      title = paste("Boxplot:", var_name),
                      xlab = "", ylab = "Value")
-      
-      if (input$add_points) {
-        p <- p + geom_jitter(width = 0.2, alpha = 0.6, size = 2)
-      }
+    }
+    if (input$add_points) {
+      p <- p + geom_jitter(width = 0.2, alpha = 0.6, size = 2)
     }
     
+    letters_added <- FALSE
     if (n_groups > 2 && !input$use_nonparametric) {
-      tryCatch({
-        aov_res <- aov(Value ~ Group, data = plot_data)
-        tukey_res <- TukeyHSD(aov_res)
-        p_adj <- tukey_res$Group[, "p adj"]
-        letters_obj <- multcompLetters(p_adj)
-        
-        letters_df <- data.frame(
-          Group = names(letters_obj$Letters),
-          Letters = letters_obj$Letters,
+      # Tukey HSD letters. Groups are renamed G1..Gk for the test: multcompLetters
+      # splits the pair names "A-B" on "-", which breaks group names containing "-".
+      letters_df <- tryCatch({
+        safe <- plot_data
+        safe$Group <- factor(safe$Group, levels = levels(plot_data$Group),
+                             labels = paste0("G", seq_len(n_groups)))
+        tukey_res <- TukeyHSD(aov(Value ~ Group, data = safe))
+        let <- multcompLetters(tukey_res$Group[, "p adj"])$Letters
+        max_vals <- aggregate(Value ~ Group, data = plot_data, FUN = max)
+        data.frame(
+          Group = max_vals$Group,
+          Letters = unname(let[paste0("G", match(max_vals$Group, levels(plot_data$Group)))]),
+          MaxValue = max_vals$Value,
           stringsAsFactors = FALSE
         )
-        
-        max_vals <- aggregate(Value ~ Group, data = plot_data, FUN = max)
-        colnames(max_vals) <- c("Group", "MaxValue")
-        letters_df <- merge(letters_df, max_vals, by = "Group")
-        
+      }, error = function(e) NULL)
+      
+      if (!is.null(letters_df)) {
         y_span <- diff(range(plot_data$Value, na.rm = TRUE))
         if (!is.finite(y_span) || y_span <= 0) y_span <- 1
         letters_df$YPos <- letters_df$MaxValue + 0.08 * y_span
-        
+        letters_df$Group <- factor(letters_df$Group, levels = levels(plot_data$Group))
         p <- p + geom_text(
           data = letters_df,
           aes(x = Group, y = YPos, label = Letters),
           size = 6,
           inherit.aes = FALSE
         )
-      }, error = function(e) {
-        p <- p + stat_compare_means(method = "anova")
-      })
-    } else {
+        letters_added <- TRUE
+      }
+    }
+    if (!letters_added) {
       test_method <- if(input$use_nonparametric) "kruskal.test" else "anova"
       p <- p + stat_compare_means(method = test_method)
     }
     
     p + theme_minimal(base_size = 14) + theme(legend.position = "none")
+  }
+  
+  output$univariate_boxplot <- renderPlot({
+    req(selected_univ_var(), X_filtered(), groups_filtered())
+    univ_boxplot_gg()
   })
   
   # CSV export: exact same order as the plot
@@ -2261,19 +2455,31 @@ server <- function(input, output, session) {
     df
   })
   
-  # PCA and other multivariate analyses - UPDATED to use X_feature_filtered
+  # PCA and other multivariate analyses use X_feature_filtered (selected groups,
+  # scaled on those samples, optional feature filter)
   pca_model <- reactive({
-    req(X_feature_filtered())
+    req(X_feature_filtered(), ncomp_eff())
     tryCatch({
-      mixOmics::pca(X_feature_filtered(), ncomp = input$ncomp_mv, center = FALSE, scale = FALSE)
+      # center = TRUE: without centering, PC1 mostly captures the mean of the
+      # data whenever the scaling method is "None" (or groups were excluded)
+      mixOmics::pca(X_feature_filtered(), ncomp = ncomp_eff(), center = TRUE, scale = FALSE)
     }, error = function(e) {
       showNotification(paste("PCA error:", e$message), type = "error")
       NULL
     })
   })
   
+  # Component selectors must refer to computed components
+  check_comps <- function(...) {
+    comps <- c(...)
+    validate(need(all(!is.na(comps)) && all(comps >= 1) && all(comps <= ncomp_eff()),
+                  paste0("Component numbers must be between 1 and ", ncomp_eff(),
+                         " (increase 'Number of components' in the sidebar for more).")))
+  }
+
   output$pca_scores <- renderPlot({
     req(pca_model(), groups_filtered())
+    check_comps(input$pca_x, input$pca_y)
     mixOmics::plotIndiv(pca_model(), group = groups_filtered(), 
                         comp = c(input$pca_x, input$pca_y),
                         ind.names = FALSE, legend = TRUE, ellipse = TRUE, 
@@ -2288,19 +2494,22 @@ server <- function(input, output, session) {
   
   output$pca_biplot <- renderPlot({
     req(pca_model(), groups_filtered())
+    check_comps(input$pca_x, input$pca_y)
     biplot(pca_model(), group = groups_filtered(), comp = c(input$pca_x, input$pca_y))
   })
   
   selected_pca_scores <- reactive({
     req(pca_model())
-    comps <- unique(pmin(c(input$pca_x, input$pca_y), ncol(pca_model()$x)))
+    check_comps(input$pca_x, input$pca_y)
+    comps <- unique(c(input$pca_x, input$pca_y))
     pca_model()$x[, comps, drop = FALSE]
   })
   
   output$pca_permanova <- renderPrint({
     req(selected_pca_scores(), groups_filtered())
     df <- data.frame(group = groups_filtered())
-    result <- vegan::adonis2(selected_pca_scores() ~ group, data = df)
+    apply_seed()
+    result <- vegan::adonis2(selected_pca_scores() ~ group, data = df, permutations = 999, method = "euclidean")
     cat("Selected groups:", paste(levels(groups_filtered()), collapse = ", "), "\n\n")
     print(result)
   })
@@ -2337,9 +2546,9 @@ server <- function(input, output, session) {
   
   # PLS-DA - UPDATED to use X_feature_filtered
   plsda_model <- reactive({
-    req(X_feature_filtered(), groups_filtered())
+    req(X_feature_filtered(), groups_filtered(), ncomp_eff())
     tryCatch({
-      mixOmics::plsda(X_feature_filtered(), groups_filtered(), ncomp = input$ncomp_mv, scale = FALSE)
+      mixOmics::plsda(X_feature_filtered(), groups_filtered(), ncomp = ncomp_eff(), scale = FALSE)
     }, error = function(e) {
       showNotification(paste("PLS-DA error:", e$message), type = "error")
       NULL
@@ -2348,6 +2557,7 @@ server <- function(input, output, session) {
   
   output$plsda_scores <- renderPlot({
     req(plsda_model(), groups_filtered())
+    check_comps(input$plsda_x, input$plsda_y)
     mixOmics::plotIndiv(plsda_model(), comp = c(input$plsda_x, input$plsda_y),
                         group = groups_filtered(), ind.names = FALSE, 
                         ellipse = TRUE, legend = TRUE, star = TRUE, 
@@ -2358,17 +2568,21 @@ server <- function(input, output, session) {
   observeEvent(input$run_plsda_perf, {
     req(plsda_model())
     
-    withProgress(message = "Computing performance...", value = 0, {
+    withProgress(message = "Computing performance...", value = 0.3, {
       tryCatch({
-        perf <- mixOmics::perf(
-          plsda_model(),
-          validation = input$plsda_cv_method,
-          folds = if(input$plsda_cv_method == "Mfold") input$plsda_folds else NULL,
-          nrepeat = if(input$plsda_cv_method == "Mfold") input$plsda_nrepeat else NULL,
-          progressBar = TRUE,
-          auc = TRUE,
-          ncomp = input$ncomp_mv
-        )
+        args <- list(plsda_model(), validation = input$plsda_cv_method,
+                     progressBar = FALSE, auc = TRUE)
+        if (input$plsda_cv_method == "Mfold") {
+          # Never more folds than the smallest group can fill
+          folds <- cv_folds(input$plsda_folds, groups_filtered())
+          if (folds < input$plsda_folds) {
+            showNotification(paste("Folds reduced to", folds, "(smallest group size)"), type = "message")
+          }
+          args$folds <- folds
+          args$nrepeat <- input$plsda_nrepeat
+        }
+        apply_seed()
+        perf <- do.call(mixOmics::perf, args)
         
         rv$plsda_perf <- perf
         showNotification("Performance calculated", type = "message")
@@ -2406,9 +2620,11 @@ server <- function(input, output, session) {
 
   output$plsda_permanova <- renderPrint({
     req(plsda_model(), groups_filtered())
+    check_comps(input$plsda_x, input$plsda_y)
     scores <- plsda_model()$variates$X[, c(input$plsda_x, input$plsda_y), drop = FALSE]
     df <- data.frame(group = groups_filtered())
-    result <- vegan::adonis2(scores ~ group, data = df)
+    apply_seed()
+    result <- vegan::adonis2(scores ~ group, data = df, permutations = 999, method = "euclidean")
     cat("Selected groups:", paste(levels(groups_filtered()), collapse = ", "), "\n\n")
     print(result)
   })
@@ -2417,7 +2633,7 @@ server <- function(input, output, session) {
     req(plsda_model())
     
     validate(
-      need(input$plsda_auc_comp <= input$ncomp_mv && input$plsda_auc_comp >= 1, 
+      need(!is.na(input$plsda_auc_comp) && input$plsda_auc_comp <= ncomp_eff() && input$plsda_auc_comp >= 1, 
            "Invalid component number")
     )
     
@@ -2438,7 +2654,7 @@ server <- function(input, output, session) {
     }
     
     # Show info about feature filtering
-    if(!is.null(rv$filtered_features) && rv$filter_source == "univariate") {
+    if(!is.null(rv$mv_features)) {
       showNotification(
         paste("Tuning sPLS-DA with", length(active_features()), 
               "pre-filtered significant features from ANOVA"),
@@ -2463,20 +2679,23 @@ server <- function(input, output, session) {
           test_keepX <- c(min(5, max_features - 1))
         }
         
-        min_group_size <- min(table(groups_filtered()))
-        n_folds <- max(2, min(5, min_group_size))
+        n_folds <- cv_folds(5, groups_filtered())
         
+        # scale = FALSE: the data are already scaled with the method chosen in the
+        # sidebar (mixOmics would otherwise apply UV scaling on top of it)
+        apply_seed()
         tune_result <- mixOmics::tune.splsda(
-          X_feature_filtered(),  # CHANGED from X_filtered()
+          X_feature_filtered(),
           groups_filtered(),
-          ncomp = min(5, input$ncomp_mv),
+          ncomp = min(5, ncomp_eff()),
           validation = 'Mfold',
           folds = n_folds,
-          nrepeat = 10,
+          nrepeat = if (IS_WEBR) 5 else 10,
           dist = 'max.dist',
           measure = "BER",
           test.keepX = test_keepX,
-          progressBar = TRUE
+          scale = FALSE,
+          progressBar = FALSE
         )
         
         rv$splsda_tune_result <- tune_result
@@ -2517,7 +2736,7 @@ server <- function(input, output, session) {
     }
     
     tryCatch({
-      mixOmics::splsda(X_feature_filtered(), groups_filtered(), ncomp = ncomp, keepX = keepX)
+      mixOmics::splsda(X_feature_filtered(), groups_filtered(), ncomp = ncomp, keepX = keepX, scale = FALSE)
     }, error = function(e) {
       showNotification(paste("sPLS-DA error:", e$message), type = "error")
       NULL
@@ -2540,7 +2759,7 @@ server <- function(input, output, session) {
       
       cat("Features per component:\n")
       for (i in 1:model$ncomp) {
-        selected_i <- selectVar(model, comp = i)
+        selected_i <- mixOmics::selectVar(model, comp = i)
         n_features <- length(selected_i$name)
         cat("Component", i, ":", n_features, "features\n")
       }
@@ -2548,7 +2767,7 @@ server <- function(input, output, session) {
       # Get all unique features across all components
       all_features <- character()
       for (i in 1:model$ncomp) {
-        selected_i <- selectVar(model, comp = i)
+        selected_i <- mixOmics::selectVar(model, comp = i)
         all_features <- c(all_features, selected_i$name)
       }
       all_features <- unique(all_features)
@@ -2579,15 +2798,15 @@ server <- function(input, output, session) {
 
     withProgress(message = "Evaluating final sPLS-DA model...", value = 0, {
       tryCatch({
-        min_group_size <- min(table(groups_filtered()))
-        n_folds <- max(2, min(5, min_group_size))
+        n_folds <- cv_folds(5, groups_filtered())
 
+        apply_seed()
         perf_res <- mixOmics::perf(
           final_splsda_model(),
           validation = "Mfold",
           folds = n_folds,
-          nrepeat = 50,
-          progressBar = TRUE,
+          nrepeat = if (IS_WEBR) 10 else 50,
+          progressBar = FALSE,
           auc = TRUE
         )
 
@@ -2702,7 +2921,7 @@ server <- function(input, output, session) {
 
     all_selected_features <- character()
     for (i in 1:model$ncomp) {
-      selected_i <- selectVar(model, comp = i)
+      selected_i <- mixOmics::selectVar(model, comp = i)
       all_selected_features <- c(all_selected_features, selected_i$name)
     }
     all_selected_features <- unique(all_selected_features)
@@ -2710,6 +2929,7 @@ server <- function(input, output, session) {
 
     mat <- as.matrix(X_data[, all_selected_features, drop = FALSE])
     mat_scaled <- scale(mat)
+    mat_scaled[!is.finite(mat_scaled)] <- 0
     mat_t <- t(mat_scaled)   # features x samples
     rownames(mat_t) <- substring(rownames(mat_t), 1, 40)
 
@@ -2864,7 +3084,7 @@ server <- function(input, output, session) {
     plsr_model <- reactive({
       req(X_plsr(), Y_plsr())
       tryCatch({
-        mixOmics::pls(X_plsr(), Y_plsr(), ncomp = input$ncomp_mv, mode = "regression", scale = FALSE)
+        mixOmics::pls(X_plsr(), Y_plsr(), ncomp = min(ncomp_eff(), ncol(X_plsr())), mode = "regression", scale = FALSE)
       }, error = function(e) {
         showNotification(paste("PLS Regression error:", e$message), type = "error")
         NULL
@@ -2967,15 +3187,15 @@ server <- function(input, output, session) {
     observeEvent(input$run_plsr_perf, {
       req(plsr_model())
 
-      withProgress(message = "Computing PLS-R performance...", value = 0, {
+      withProgress(message = "Computing PLS-R performance...", value = 0.3, {
         tryCatch({
-          perf_res <- mixOmics::perf(
-            plsr_model(),
-            validation = input$plsr_cv_method,
-            folds = if (input$plsr_cv_method == "Mfold") input$plsr_folds else NULL,
-            nrepeat = if (input$plsr_cv_method == "Mfold") input$plsr_nrepeat else NULL,
-            progressBar = TRUE
-          )
+          args <- list(plsr_model(), validation = input$plsr_cv_method, progressBar = FALSE)
+          if (input$plsr_cv_method == "Mfold") {
+            args$folds <- cv_folds(input$plsr_folds, n = nrow(X_plsr()))
+            args$nrepeat <- input$plsr_nrepeat
+          }
+          apply_seed()
+          perf_res <- do.call(mixOmics::perf, args)
 
           rv$plsr_perf <- perf_res
           showNotification("Performance calculated", type = "message")
@@ -3066,7 +3286,7 @@ server <- function(input, output, session) {
     observeEvent(input$run_splsr_tuning, {
       req(X_plsr(), Y_plsr())
 
-      if (!is.null(rv$filtered_features) && rv$filter_source == "univariate") {
+      if (!is.null(rv$mv_features)) {
         showNotification(
           paste("Tuning sPLS-R with", ncol(X_plsr()),
                 "pre-filtered significant features from ANOVA"),
@@ -3087,17 +3307,19 @@ server <- function(input, output, session) {
           test_keepX <- test_keepX[test_keepX < max_features]
           if (length(test_keepX) == 0) test_keepX <- c(min(5, max_features - 1))
 
-          n_folds <- max(2, min(5, floor(nrow(X_plsr()) / 2)))
+          n_folds <- cv_folds(5, n = nrow(X_plsr()))
 
+          apply_seed()
           tune_result <- mixOmics::tune.spls(
             X_plsr(), Y_plsr(),
-            ncomp = min(5, input$ncomp_mv),
+            ncomp = min(5, ncomp_eff()),
             validation = 'Mfold',
             folds = n_folds,
-            nrepeat = 10,
+            nrepeat = if (IS_WEBR) 5 else 10,
             measure = input$splsr_tune_measure,
             test.keepX = test_keepX,
-            progressBar = TRUE
+            scale = FALSE,
+            progressBar = FALSE
           )
 
           rv$splsr_tune_result <- tune_result
@@ -3142,7 +3364,7 @@ server <- function(input, output, session) {
       }
 
       tryCatch({
-        mixOmics::spls(X_plsr(), Y_plsr(), ncomp = ncomp, keepX = keepX, mode = "regression")
+        mixOmics::spls(X_plsr(), Y_plsr(), ncomp = ncomp, keepX = keepX, mode = "regression", scale = FALSE)
       }, error = function(e) {
         showNotification(paste("sPLS-R error:", e$message), type = "error")
         NULL
@@ -3188,13 +3410,13 @@ server <- function(input, output, session) {
 
         cat("Features per component:\n")
         for (i in 1:model$ncomp) {
-          sel_i <- selectVar(model, comp = i)$X
+          sel_i <- mixOmics::selectVar(model, comp = i)$X
           cat("Component", i, ":", length(sel_i$name), "features\n")
         }
 
         all_features <- character()
         for (i in 1:model$ncomp) {
-          all_features <- c(all_features, selectVar(model, comp = i)$X$name)
+          all_features <- c(all_features, mixOmics::selectVar(model, comp = i)$X$name)
         }
         all_features <- unique(all_features)
 
@@ -3222,14 +3444,15 @@ server <- function(input, output, session) {
 
       withProgress(message = "Evaluating final sPLS-R model...", value = 0, {
         tryCatch({
-          n_folds <- max(2, min(5, floor(nrow(X_plsr()) / 2)))
+          n_folds <- cv_folds(5, n = nrow(X_plsr()))
 
+          apply_seed()
           perf_res <- mixOmics::perf(
             final_splsr_model(),
             validation = "Mfold",
             folds = n_folds,
-            nrepeat = 50,
-            progressBar = TRUE
+            nrepeat = if (IS_WEBR) 10 else 50,
+            progressBar = FALSE
           )
 
           rv$splsr_final_perf <- perf_res
@@ -3273,7 +3496,7 @@ server <- function(input, output, session) {
 
         results_list <- list()
         for (i in 1:model$ncomp) {
-          sel_i <- selectVar(model, comp = i)$X
+          sel_i <- mixOmics::selectVar(model, comp = i)$X
           df <- data.frame(
             Variable = sel_i$name,
             Component = paste0("Comp", i),
@@ -3340,13 +3563,14 @@ server <- function(input, output, session) {
 
       all_selected_features <- character()
       for (i in 1:model$ncomp) {
-        all_selected_features <- c(all_selected_features, selectVar(model, comp = i)$X$name)
+        all_selected_features <- c(all_selected_features, mixOmics::selectVar(model, comp = i)$X$name)
       }
       all_selected_features <- unique(all_selected_features)
       validate(need(length(all_selected_features) > 0, "No features selected in sPLS-R model"))
 
       mat <- as.matrix(X_data[, all_selected_features, drop = FALSE])
       mat_scaled <- scale(mat)
+      mat_scaled[!is.finite(mat_scaled)] <- 0
       mat_t <- t(mat_scaled)
       rownames(mat_t) <- substring(rownames(mat_t), 1, 40)
 
@@ -3534,10 +3758,10 @@ server <- function(input, output, session) {
     output$download_univ_filtered_data <- downloadHandler(
       filename = function() { "filtered_data_significant.csv" },
       content = function(file) {
-        req(filtered_univariate_results(), X_feature_filtered(), groups_filtered())
+        req(filtered_univariate_results(), X_filtered(), groups_filtered())
         
         sig_vars <- filtered_univariate_results()$Variable
-        X_df <- X_feature_filtered()
+        X_df <- X_filtered()
         filtered_data <- X_df[, sig_vars, drop = FALSE]
         filtered_data <- cbind(Group = groups_filtered(), filtered_data)
         
@@ -3577,81 +3801,15 @@ server <- function(input, output, session) {
       contentType = "text/csv"
     )
 
-    # Univariate boxplot PDF
+    # Univariate boxplot PDF (same figure as on screen)
     output$download_univ_boxplot <- downloadHandler(
       filename = function() { "univariate_boxplot.pdf" },
       content = function(file) {
-        req(selected_univ_var(), X_feature_filtered(), groups_filtered())
+        req(selected_univ_var(), X_filtered(), groups_filtered())
+        p <- univ_boxplot_gg()
         
         pdf(file, width = input$pdf_width, height = input$pdf_height)
-        tryCatch({
-          var_name <- selected_univ_var()
-          X_df <- X_feature_filtered()
-          plot_data <- data.frame(
-            Group = groups_filtered(),
-            Value = X_df[[var_name]]
-          )
-          plot_data <- plot_data[complete.cases(plot_data), ]
-          
-          n_groups <- length(levels(plot_data$Group))
-          
-          if (input$plot_type == "violin") {
-            p <- ggplot(plot_data, aes(x = Group, y = Value, fill = Group)) +
-              geom_violin(trim = FALSE, alpha = 0.7) +
-              scale_fill_manual(values = mixOmics::color.mixo(1:n_groups)) +
-              labs(title = paste("Violin plot:", var_name), x = "", y = "Value") +
-              theme_minimal(base_size = 14) +
-              theme(legend.position = "none")
-            
-            if (input$add_points) {
-              p <- p + geom_jitter(width = 0.2, alpha = 0.6, size = 2)
-            }
-          } else {
-            p <- ggboxplot(plot_data, x = "Group", y = "Value", fill = "Group",
-                           palette = mixOmics::color.mixo(1:n_groups),
-                           title = paste("Boxplot:", var_name),
-                           xlab = "", ylab = "Value")
-            
-            if (input$add_points) {
-              p <- p + geom_jitter(width = 0.2, alpha = 0.6, size = 2)
-            }
-          }
-          
-          if (n_groups > 2 && !input$use_nonparametric) {
-            tryCatch({
-              aov_res <- aov(Value ~ Group, data = plot_data)
-              tukey_res <- TukeyHSD(aov_res)
-              p_adj <- tukey_res$Group[, "p adj"]
-              letters_obj <- multcompLetters(p_adj)
-              
-              letters_df <- data.frame(
-                Group = names(letters_obj$Letters),
-                Letters = letters_obj$Letters,
-                stringsAsFactors = FALSE
-              )
-              
-              max_vals <- aggregate(Value ~ Group, data = plot_data, FUN = max)
-              colnames(max_vals) <- c("Group", "MaxValue")
-              letters_df <- merge(letters_df, max_vals, by = "Group")
-              
-              p <- p + geom_text(
-                data = letters_df,
-                aes(x = Group, y = MaxValue * 1.1, label = Letters),
-                size = 6,
-                inherit.aes = FALSE
-              )
-            }, error = function(e) {
-              p <- p + stat_compare_means(method = "anova")
-            })
-          } else {
-            test_method <- if(input$use_nonparametric) "kruskal.test" else "anova"
-            p <- p + stat_compare_means(method = test_method)
-          }
-          
-          print(p + theme_minimal(base_size = 14) + theme(legend.position = "none"))
-        }, finally = {
-          dev.off()
-        })
+        tryCatch(print(p), finally = dev.off())
       },
       contentType = "application/pdf"
     )
@@ -3662,39 +3820,10 @@ server <- function(input, output, session) {
       filename = function() { "volcano_plot.pdf" },
       content = function(file) {
         req(volcano_data())
+        p <- volcano_gg()
         
         pdf(file, width = input$pdf_width, height = input$pdf_height)
-        tryCatch({
-          data <- volcano_data()
-          
-          p <- ggplot(data, aes(x = log2FC, y = negLog10P, color = Significance)) +
-            geom_vline(xintercept = c(-input$volcano_fc, input$volcano_fc), linetype = "dashed") +
-            geom_hline(yintercept = input$volcano_pval, linetype = "dashed") +
-            scale_color_manual(values = c("Up" = "red", "Down" = "blue", "NS" = "grey")) +
-            labs(title = paste(input$volcano_group2, "vs", input$volcano_group1),
-                 x = "Log2 FC", y = "-Log10(p-adj)") +
-            theme_minimal()
-          
-          if("point_size" %in% names(data)) {
-            p <- p + geom_point(aes(size = point_size), alpha = 0.6) +
-              scale_size_continuous(range = input$volcano_size_range, 
-                                    name = input$volcano_size_col,
-                                    guide = "legend")
-          } else {
-            p <- p + geom_point(alpha = 0.6, size = 2)
-          }
-          
-          if (input$volcano_label && input$volcano_n_labels > 0) {
-            sig_data <- data[data$Significance != "NS", ]
-            sig_data <- sig_data[order(sig_data$adj_pvalue), ]
-            sig_data <- sig_data[1:min(input$volcano_n_labels, nrow(sig_data)), ]
-            p <- p + geom_text_repel(data = sig_data, aes(label = Variable), size = 3)
-          }
-          
-          print(p)
-        }, finally = {
-          dev.off()
-        })
+        tryCatch(print(p), finally = dev.off())
       },
       contentType = "application/pdf"
     )
@@ -3722,30 +3851,11 @@ server <- function(input, output, session) {
     output$download_volcano_boxplot <- downloadHandler(
       filename = function() { "volcano_boxplot.pdf" },
       content = function(file) {
-        req(selected_volcano_var(), X_feature_filtered(), groups_filtered())
+        req(selected_volcano_var(), X_filtered(), groups_filtered())
+        p <- volcano_boxplot_gg()
         
         pdf(file, width = input$pdf_width, height = input$pdf_height)
-        tryCatch({
-          var_name <- selected_volcano_var()
-          X_unscaled <- tryCatch(X_unscaled_filtered(), error = function(e) NULL)
-          X_df <- if (!is.null(X_unscaled) && var_name %in% colnames(X_unscaled)) X_unscaled else X_feature_filtered()
-          plot_data <- data.frame(Group = groups_filtered(), Value = X_df[[var_name]])
-          plot_data <- plot_data[plot_data$Group %in% c(input$volcano_group1, input$volcano_group2), ]
-          plot_data <- plot_data[complete.cases(plot_data), ]
-          plot_data$Group <- factor(plot_data$Group)
-          
-          y_lab <- if (!is.null(X_unscaled) && var_name %in% colnames(X_unscaled)) "Abundance (unscaled)" else "Value"
-          
-          p <- ggboxplot(plot_data, x = "Group", y = "Value", fill = "Group",
-                         palette = c("blue", "red"), title = paste(var_name),
-                         ylab = y_lab) +
-            stat_compare_means(method = if(input$use_nonparametric) "wilcox.test" else "t.test") +
-            theme_minimal() + theme(legend.position = "none")
-          
-          print(p)
-        }, finally = {
-          dev.off()
-        })
+        tryCatch(print(p), finally = dev.off())
       },
       contentType = "application/pdf"
     )

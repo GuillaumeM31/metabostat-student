@@ -43,4 +43,4 @@ message("Opening your default web browser...")
 message("To stop the application, press Ctrl+C or Esc in R/RStudio.")
 message("--------------------------------------------------------------\n")
 
-shiny::runApp(appDir = ".", launch.browser = TRUE)
+shiny::runApp(appDir = "app", launch.browser = TRUE)
